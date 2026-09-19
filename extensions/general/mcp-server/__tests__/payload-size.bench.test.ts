@@ -487,7 +487,15 @@ describe('tools/list payload size guard', () => {
     //     year, karens); the contract still measured ~150 tokens over a
     //     ceiling with ~50 headroom. gnubok_get_vacation_balance gained its
     //     pools too but is search-only and does not count.
-    expect(approxTokens).toBeLessThan(60_700)
+    //   * 60.7K to 62.2K with the anläggningsregister family (API parity,
+    //     2026-09-19): five tools, of which only gnubok_list_assets and
+    //     gnubok_create_asset ride the default catalog (get/update/dispose are
+    //     search-only and named by the list tool). The register is a new
+    //     resource, so its ~20-field row schema had no earlier tool to share
+    //     with; the item and write schemas were trimmed to bare formats first
+    //     (measured 61 849 after the trim; 61 975 once merged with the
+    //     cutover-balance step above).
+    expect(approxTokens).toBeLessThan(62_200)
   })
 
   /**
