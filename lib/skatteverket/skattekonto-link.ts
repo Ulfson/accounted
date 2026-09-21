@@ -82,6 +82,23 @@ export function entrySettlesAmount(
   return { ok: false, via: null }
 }
 
+function entryLinesMatchZeroNetRows(lines: EntryForLink['lines'], amounts: number[]): boolean {
+  const onAccount = (lines ?? []).filter((line) => line.account_number === SKATTEKONTO_ACCOUNT)
+  if (onAccount.length !== amounts.length) return false
+
+  const signedLines = onAccount.map((line) => {
+    const debit = roundOre(Number(line.debit_amount))
+    const credit = roundOre(Number(line.credit_amount))
+    if ((debit > 0) === (credit > 0)) return null
+    return roundOre(debit - credit)
+  })
+  if (signedLines.some((amount) => amount === null)) return false
+
+  const sortedRows = amounts.map(roundOre).sort((a, b) => a - b)
+  const sortedLines = (signedLines as number[]).sort((a, b) => a - b)
+  return sortedRows.every((amount, index) => amount !== 0 && amount === sortedLines[index])
+}
+
 export interface LinkSkattekontoRowResult {
   skattekonto_transaction_id: string
   journal_entry_id: string
@@ -249,8 +266,9 @@ export interface LinkSkattekontoRowsResult {
  * Link SEVERAL open SKV rows to ONE verifikat: the N:1 worksheet selection
  * (one AGI verifikat settling the avdragen skatt + arbetsgivaravgift rows,
  * one payment verifikat covering a row pair). The verifikat's 1630 side must
- * settle the SUM of the rows; each row then gets the same guarded pointer as
- * the single link. The write is ONE guarded UPDATE over the whole group: a
+ * settle the SUM of the rows. A zero-net group instead requires every signed
+ * 1630 line to match one row exactly. Each row then gets the same guarded
+ * pointer as the single link. The write is ONE guarded UPDATE over the whole group: a
  * concurrent link shrinks the hit set, and a partial hit is rolled back and
  * reported as LINK_RACE, so a group is never left half-linked.
  */
@@ -285,12 +303,6 @@ export async function linkSkattekontoRows(
   }
 
   const sum = roundOre(typed.reduce((s, r) => s + Number(r.belopp_skatteverket), 0))
-  if (sum === 0) {
-    throw new SkattekontoLinkError(
-      'De valda händelserna nettar till 0 och kan inte kopplas mot ett verifikat.',
-      'INVALID_CANDIDATE',
-    )
-  }
 
   const { data: entry, error: entryError } = await supabase
     .from('journal_entries')
@@ -304,10 +316,15 @@ export async function linkSkattekontoRows(
   if (entry.status === 'reversed') {
     throw new SkattekontoLinkError('Verifikatet är makulerat och kan inte kopplas.', 'INVALID_CANDIDATE')
   }
-  const settles = entrySettlesAmount(entry.lines, sum)
+  const settles = sum === 0
+    ? {
+        ok: entryLinesMatchZeroNetRows(entry.lines, typed.map((row) => Number(row.belopp_skatteverket))),
+        via: 'entry_total' as const,
+      }
+    : entrySettlesAmount(entry.lines, sum)
   if (!settles.ok || !settles.via) {
     throw new SkattekontoLinkError(
-      'Verifikatets rader på 1630 motsvarar inte summan av de valda händelserna.',
+      'Verifikatets rader på 1630 motsvarar inte de valda händelserna.',
       'INVALID_CANDIDATE',
     )
   }

@@ -168,13 +168,68 @@ describe('linkSkattekontoRows (N:1)', () => {
     await expect(linkSkattekontoRows(supabase as never, COMPANY, [ROW, ROW2], ENTRY)).rejects.toMatchObject({ code: 'INVALID_CANDIDATE' })
   })
 
-  it('refuses when the sum does not settle the verifikat or nets to zero', async () => {
+  it('refuses when the sum does not settle the verifikat', async () => {
     enqueue({ data: [row({ belopp_skatteverket: 3000 }), row({ id: ROW2, belopp_skatteverket: 2000 })] })
     enqueue({ data: entry([{ account_number: '1630', debit_amount: 4999, credit_amount: 0 }]) })
     await expect(linkSkattekontoRows(supabase as never, COMPANY, [ROW, ROW2], ENTRY)).rejects.toMatchObject({ code: 'INVALID_CANDIDATE' })
-    reset()
+  })
+
+  it('links a zero-net group when every signed 1630 line matches a row', async () => {
+    const ROW3 = 'row-3'
+    const ROW4 = 'row-4'
+    enqueue({ data: [
+      row({ belopp_skatteverket: -3000 }),
+      row({ id: ROW2, belopp_skatteverket: 1000 }),
+      row({ id: ROW3, belopp_skatteverket: 1000 }),
+      row({ id: ROW4, belopp_skatteverket: 1000 }),
+    ] })
+    enqueue({ data: entry([
+      { account_number: '1630', debit_amount: 1000, credit_amount: 0 },
+      { account_number: '1930', debit_amount: 3000, credit_amount: 0 },
+      { account_number: '1630', debit_amount: 0, credit_amount: 3000 },
+      { account_number: '1630', debit_amount: 1000, credit_amount: 0 },
+      { account_number: '1630', debit_amount: 1000, credit_amount: 0 },
+    ]) })
+    enqueue({ data: [] })
+    enqueue({ data: [{ id: ROW }, { id: ROW2 }, { id: ROW3 }, { id: ROW4 }] })
+
+    const ids = [ROW, ROW2, ROW3, ROW4]
+    expect(await linkSkattekontoRows(supabase as never, COMPANY, ids, ENTRY)).toEqual({
+      journal_entry_id: ENTRY,
+      via: 'entry_total',
+      skattekonto_transaction_ids: ids,
+    })
+    expect(findCalls('skattekonto_transactions', 'update')).toHaveLength(1)
+  })
+
+  it.each([
+    [
+      'the wrong signed amounts',
+      [
+        { account_number: '1630', debit_amount: 2000, credit_amount: 0 },
+        { account_number: '1630', debit_amount: 0, credit_amount: 2000 },
+      ],
+    ],
+    [
+      'an extra 1630 line',
+      [
+        { account_number: '1630', debit_amount: 3000, credit_amount: 0 },
+        { account_number: '1630', debit_amount: 0, credit_amount: 3000 },
+        { account_number: '1630', debit_amount: 0, credit_amount: 0 },
+      ],
+    ],
+    [
+      'a debit and credit on the same 1630 line',
+      [
+        { account_number: '1630', debit_amount: 4000, credit_amount: 1000 },
+        { account_number: '1630', debit_amount: 0, credit_amount: 3000 },
+      ],
+    ],
+  ])('refuses a zero-net group with %s', async (_reason, lines) => {
     enqueue({ data: [row({ belopp_skatteverket: 3000 }), row({ id: ROW2, belopp_skatteverket: -3000 })] })
+    enqueue({ data: entry(lines) })
     await expect(linkSkattekontoRows(supabase as never, COMPANY, [ROW, ROW2], ENTRY)).rejects.toMatchObject({ code: 'INVALID_CANDIDATE' })
+    expect(findCalls('skattekonto_transactions', 'update')).toHaveLength(0)
   })
 
   it('refuses a verifikat already linked to a row outside the group', async () => {
