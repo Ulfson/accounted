@@ -1225,7 +1225,19 @@ describe('upsertFromPsd2', () => {
 // ── ensureManualCashAccount ──────────────────────────────────────────────
 
 interface ManualStub {
-  lookup: { data: { id: string; currency?: string } | null; error?: { message: string } | null }
+  lookup: {
+    data: {
+      id: string
+      currency?: string
+      enabled?: boolean
+      bank_connection_id?: string | null
+      invoice_payee?: boolean | null
+    } | null
+    error?: { message: string } | null
+  }
+  /** Result of the re-enable UPDATE; every payload it was called with lands in `updated`. */
+  reenable?: { error?: { message: string } | null; rows?: Array<{ id: string }> }
+  updated?: Array<Record<string, unknown>>
   insert?: { data: { id: string } | null; error?: { message: string; code?: string } | null }
   reread?: { data: { id: string; currency?: string } | null; error?: { message: string } | null }
   inserted: Array<Record<string, unknown>>
@@ -1250,6 +1262,24 @@ function makeManualSupabase(stub: ManualStub): SupabaseClient {
             })),
           })),
         })),
+        // re-enable path: update().eq().eq().is()
+        update: vi.fn((payload: Record<string, unknown>) => {
+          ;(stub.updated ??= []).push(payload)
+          return {
+            eq: vi.fn(() => ({
+              eq: vi.fn(() => ({
+                is: vi.fn(() => ({
+                  select: vi.fn(() =>
+                    Promise.resolve({
+                      data: stub.reenable?.error ? null : (stub.reenable?.rows ?? [{ id: 'ca-1' }]),
+                      error: stub.reenable?.error ?? null,
+                    }),
+                  ),
+                })),
+              })),
+            })),
+          }
+        }),
         // insert().select('id').single()
         insert: vi.fn((payload: Record<string, unknown>) => {
           stub.inserted.push(payload)
@@ -1270,6 +1300,102 @@ function makeManualSupabase(stub: ManualStub): SupabaseClient {
 }
 
 describe('ensureManualCashAccount', () => {
+  // A company that disabled an account as unused and then puts transactions on
+  // its ledger again (bank-file import, create_transactions, Stripe sync) is
+  // using it: binding the rows to a hidden account would recreate the state
+  // the disable guard refuses, so the account comes back on (desk crm#59).
+  describe('a disabled account on the ledger', () => {
+    it('re-enables a disabled account no bank connection holds and binds to it', async () => {
+      const stub: ManualStub = {
+        lookup: { data: { id: 'ca-1', currency: 'SEK', enabled: false, bank_connection_id: null } },
+        inserted: [],
+        lookupCount: 0,
+      }
+      const id = await ensureManualCashAccount(makeManualSupabase(stub), 'c1', '1930', 'SEK')
+      expect(id).toBe('ca-1')
+      expect(stub.updated).toEqual([{ enabled: true }])
+      expect(stub.inserted).toHaveLength(0)
+    })
+
+    it('leaves a disabled account a bank connection holds alone: that flag is the connection\'s', async () => {
+      const stub: ManualStub = {
+        lookup: { data: { id: 'ca-1', currency: 'SEK', enabled: false, bank_connection_id: 'conn-1' } },
+        inserted: [],
+        lookupCount: 0,
+      }
+      const id = await ensureManualCashAccount(makeManualSupabase(stub), 'c1', '1930', 'SEK')
+      expect(id).toBe('ca-1')
+      expect(stub.updated ?? []).toHaveLength(0)
+    })
+
+    it('does not write to an account that is already enabled', async () => {
+      const stub: ManualStub = {
+        lookup: { data: { id: 'ca-1', currency: 'SEK', enabled: true, bank_connection_id: null } },
+        inserted: [],
+        lookupCount: 0,
+      }
+      await ensureManualCashAccount(makeManualSupabase(stub), 'c1', '1930', 'SEK')
+      expect(stub.updated ?? []).toHaveLength(0)
+    })
+
+    it('refuses a currency mismatch before re-enabling anything', async () => {
+      const stub: ManualStub = {
+        lookup: { data: { id: 'ca-1', currency: 'USD', enabled: false, bank_connection_id: null } },
+        inserted: [],
+        lookupCount: 0,
+      }
+      await expect(
+        ensureManualCashAccount(makeManualSupabase(stub), 'c1', '1930', 'SEK'),
+      ).rejects.toThrow(/denominated in USD/)
+      expect(stub.updated ?? []).toHaveLength(0)
+    })
+
+    // Swedish compliance review: enabled is one of isUsableInvoicePayee's
+    // conditions and the toggle is owner/admin. A payee may have been turned
+    // off because its printed details are stale; an import must not put them
+    // back on customer invoices.
+    it('refuses to turn an invoice payee back on, and writes nothing', async () => {
+      const stub: ManualStub = {
+        lookup: {
+          data: { id: 'ca-1', currency: 'SEK', enabled: false, bank_connection_id: null, invoice_payee: true },
+        },
+        inserted: [],
+        lookupCount: 0,
+      }
+      await expect(
+        ensureManualCashAccount(makeManualSupabase(stub), 'c1', '1930', 'SEK'),
+      ).rejects.toMatchObject({ code: 'CASH_ACCOUNT_DISABLED_PAYEE' })
+      expect(stub.updated ?? []).toHaveLength(0)
+      expect(stub.inserted).toHaveLength(0)
+    })
+
+    // Superagent P2: the guarded UPDATE can match nothing when a bank connection
+    // claims the row between the read and the write. That is not a success.
+    it('fails closed when the re-enable matches no row', async () => {
+      const stub: ManualStub = {
+        lookup: { data: { id: 'ca-1', currency: 'SEK', enabled: false, bank_connection_id: null } },
+        reenable: { rows: [] },
+        inserted: [],
+        lookupCount: 0,
+      }
+      await expect(
+        ensureManualCashAccount(makeManualSupabase(stub), 'c1', '1930', 'SEK'),
+      ).rejects.toThrow(/account changed while it was being turned back on/)
+    })
+
+    it('fails loudly when the re-enable write fails, instead of binding to a hidden account', async () => {
+      const stub: ManualStub = {
+        lookup: { data: { id: 'ca-1', currency: 'SEK', enabled: false, bank_connection_id: null } },
+        reenable: { error: { message: 'rls denied' } },
+        inserted: [],
+        lookupCount: 0,
+      }
+      await expect(
+        ensureManualCashAccount(makeManualSupabase(stub), 'c1', '1930', 'SEK'),
+      ).rejects.toThrow(/re-enable failed: rls denied/)
+    })
+  })
+
   it('returns the existing row id without inserting when the currency matches', async () => {
     const stub: ManualStub = { lookup: { data: { id: 'ca-1', currency: 'SEK' } }, inserted: [], lookupCount: 0 }
     const id = await ensureManualCashAccount(makeManualSupabase(stub), 'c1', '1935', 'sek')

@@ -1517,6 +1517,70 @@ export async function upsertFromPsd2(
 }
 
 /**
+ * Turn a disabled cash account back on because transactions are being put on
+ * it. One definition for every path that binds rows to an account by ledger:
+ * ensureManualCashAccount (bank-file import, create_transactions, Stripe sync)
+ * and the move-transaction route.
+ *
+ * The company turned the account off as unused (setEnabled); rows arriving on
+ * it mean it is in use again. Binding them to a hidden account instead would
+ * recreate exactly what the disable guard refuses (open transactions on a
+ * disabled account), refusing would stall unattended callers, and a second
+ * row is impossible under UNIQUE (company_id, ledger_account). A row a bank
+ * connection holds is left alone: its flag is the connection's, not ours.
+ *
+ * The one account it never turns on is an invoice payee. `enabled` is one of
+ * isUsableInvoicePayee's conditions and flipping it by hand is owner/admin
+ * only: a payee may have been turned off because its printed payment details
+ * are stale (an account closed at the bank), and an import must not put them
+ * back on customer invoices. That refuses with CASH_ACCOUNT_DISABLED_PAYEE and
+ * binds nothing; an owner or admin turns the account on in settings first.
+ * Only a giro or bank account (1920-1999) can be a payee, so the unattended
+ * Stripe sync (1686) never meets this.
+ *
+ * Returns whether it wrote. Throws if the write fails or matches no row, so
+ * the caller never binds rows to an account that stayed hidden.
+ */
+export async function reenableIfUnused(
+  supabase: SupabaseClient,
+  companyId: string,
+  row: {
+    id: string
+    enabled?: boolean | null
+    bank_connection_id?: string | null
+    invoice_payee?: boolean | null
+  },
+): Promise<boolean> {
+  if (row.enabled !== false || (row.bank_connection_id ?? null) !== null) return false
+  if (row.invoice_payee === true) {
+    throw Object.assign(
+      new Error('cash_accounts re-enable refused: the account is an invoice payee, an owner or admin must turn it on'),
+      { code: 'CASH_ACCOUNT_DISABLED_PAYEE' },
+    )
+  }
+  const { data, error } = await supabase
+    .from('cash_accounts')
+    .update({ enabled: true })
+    .eq('company_id', companyId)
+    .eq('id', row.id)
+    .is('bank_connection_id', null)
+    .select('id')
+  if (error) throw new Error(`cash_accounts re-enable failed: ${error.message}`)
+  // The guarded UPDATE matched nothing: a bank connection claimed the row (or
+  // it went away) between the caller's read and this write. Fail closed rather
+  // than let the caller bind rows after a re-enable that did not happen; a
+  // retry reads the row as connection-held and takes the no-op path above.
+  if (!data || data.length === 0) {
+    throw new Error('cash_accounts re-enable failed: the account changed while it was being turned back on, try again')
+  }
+  log.info('re-enabled a disabled cash account: transactions are being put on it', {
+    companyId,
+    cashAccountId: row.id,
+  })
+  return true
+}
+
+/**
  * Find (or create) a manual cash account for a BAS ledger slot, so transactions
  * ingested outside the PSD2 flow (create_transactions / CSV) can carry a real
  * cash_account_id instead of NULL. Without the link, reconciliation 404s on the
@@ -1542,7 +1606,7 @@ export async function ensureManualCashAccount(
 ): Promise<string> {
   const existing = await supabase
     .from('cash_accounts')
-    .select('id, currency')
+    .select('id, currency, enabled, bank_connection_id, invoice_payee')
     .eq('company_id', companyId)
     .eq('ledger_account', ledgerAccount)
     .maybeSingle()
@@ -1563,7 +1627,16 @@ export async function ensureManualCashAccount(
     return row.id
   }
   if (existing.data) {
-    return idIfSameCurrency(existing.data as { id: string; currency: string | null })
+    const row = existing.data as {
+      id: string
+      currency: string | null
+      enabled: boolean
+      bank_connection_id: string | null
+      invoice_payee: boolean | null
+    }
+    const id = idIfSameCurrency(row)
+    await reenableIfUnused(supabase, companyId, { ...row, id })
+    return id
   }
 
   const insert = await supabase
@@ -1605,21 +1678,97 @@ export async function ensureManualCashAccount(
 }
 
 /**
- * Toggle a cash account's enabled flag. Used by the AccountPicker when a user
- * opts in or out of syncing a particular PSD2 account.
+ * Toggle the enabled flag of a cash account no bank connection holds: the
+ * seeded manual row, a SIE-imported one, or one a disconnect released.
+ *
+ * The rules live in the UPDATE's own predicate, not in a read before it, so
+ * they hold for every caller and cannot go stale between check and write:
+ *   - never a row a bank connection holds (bank_connection_id set). Its flag
+ *     mirrors bank_connections.accounts_data[].enabled, which is also what the
+ *     sync reads; upsertFromPsd2 rewrites it from there. Flipping only this
+ *     copy would hide an account that keeps syncing, or show one the picker
+ *     turned off because another company claims it.
+ *   - never disable the primary: getPrimary() does not filter on enabled, so
+ *     the __PRIMARY_SEK__ counter account would keep routing to a hidden row.
+ *
+ * Returns null when no row qualified; the caller re-reads to say why. Open
+ * transactions are the caller's check (hasOpenTransactions): they live in
+ * another table, and ensureManualCashAccount re-enables on the ingest side.
  */
 export async function setEnabled(
   supabase: SupabaseClient,
   companyId: string,
   cashAccountId: string,
   enabled: boolean,
-): Promise<void> {
-  const { error } = await supabase
+): Promise<CashAccount | null> {
+  let q = supabase
     .from('cash_accounts')
     .update({ enabled })
     .eq('company_id', companyId)
     .eq('id', cashAccountId)
+    .is('bank_connection_id', null)
+  if (!enabled) q = q.eq('is_primary', false)
+  const { data, error } = await q.select('*').maybeSingle()
   if (error) throw new Error(`cash_accounts setEnabled failed: ${error.message}`)
+  return (data as CashAccount | null) ?? null
+}
+
+/**
+ * Whether a cash account still has work pending: an unbooked, non-ignored
+ * transaction. Disabling an account with open work would hide it from
+ * Konton and the booking flows while its rows still need a decision.
+ *
+ * A NULL journal_entry_id alone overcounts: a row split over several
+ * verifikat (transaction_voucher_links, #1553) carries the same NULL but is
+ * not open work, so junction-anchored rows are subtracted.
+ *
+ * lib/transactions/is-booked.ts names a third anchor, invoice_payments and
+ * supplier_invoice_payments. It is not subtracted here on purpose:
+ * match_batch_allocate sets journal_entry_id itself (20260824120000), so only
+ * rows from before that can be payment-anchored alone, and counting one as
+ * open errs toward refusing the disable, never toward hiding open work.
+ *
+ * No row cap: an arbitrary `.limit()` here could return a page that happens
+ * to be all junction-anchored while a genuinely open row sits past it,
+ * letting the guard wave through an account that still has unbokförda
+ * affärshändelser (BFL 5 kap). fetchAllRows pages past PostgREST's 1000-row
+ * cap instead (regression test: 60 candidates, only the 60th genuinely open).
+ */
+export async function hasOpenTransactions(
+  supabase: SupabaseClient,
+  companyId: string,
+  cashAccountId: string,
+): Promise<boolean> {
+  const candidates = await fetchAllRows<{ id: string }>(({ from, to }) =>
+    supabase
+      .from('transactions')
+      .select('id')
+      .eq('company_id', companyId)
+      .eq('cash_account_id', cashAccountId)
+      .is('journal_entry_id', null)
+      .eq('is_ignored', false)
+      .order('id', { ascending: true })
+      .range(from, to),
+  )
+  const candidateIds = candidates.map((row) => row.id)
+  if (candidateIds.length === 0) return false
+  // lib/reconciliation/bank-reconciliation.ts already imports this module, so
+  // its fetchJunctionLinkedTxIds() can't be imported back here without a
+  // cycle; the same two-column lookup, inlined, chunked at the same size the
+  // rebind helpers above use to stay under PostgREST's URL length limit.
+  const junctionLinked = new Set<string>()
+  for (const idChunk of chunkIds(candidateIds, REBIND_ID_CHUNK_SIZE)) {
+    const { data: linkRows, error: linkError } = await supabase
+      .from('transaction_voucher_links')
+      .select('transaction_id')
+      .eq('company_id', companyId)
+      .in('transaction_id', idChunk)
+    if (linkError) throw new Error(`cash_accounts hasOpenTransactions junction lookup failed: ${linkError.message}`)
+    for (const row of (linkRows ?? []) as { transaction_id: string }[]) {
+      junctionLinked.add(row.transaction_id)
+    }
+  }
+  return candidateIds.some((id) => !junctionLinked.has(id))
 }
 
 /**
