@@ -76,7 +76,7 @@ function makeSupabase(options: {
           return Promise.resolve({ data: records[0] ?? null, error: null })
         },
         then(resolve: (result: { data: Record<string, unknown>[]; error: null }) => void) {
-          resolve({ data: records, error: null })
+          resolve({ data: records.slice(0, 1000), error: null })
         },
       }
       return builder
@@ -154,6 +154,20 @@ describe('skattekonto underlag', () => {
     expect(await archiveLinkedSkattekontoUnderlag(supabase, companyId, 'user-1'))
       .toEqual({ archived: 1, failed: 0 })
     expect(uploadDocument).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['user', 'generated'] as const)('reads beyond 1000 documents before checking %s underlag', async type => {
+    const documents = Array.from({ length: 1000 }, (_, index) => ({
+      journal_entry_id: entryId, file_name: `system-${index}.pdf`, upload_source: 'system' as const,
+    }))
+    const { supabase } = makeSupabase({ documents: [...documents, {
+      journal_entry_id: entryId,
+      file_name: type === 'user' ? 'user-statement.pdf' : skattekontoUnderlagFilename(rowId, entryId),
+      upload_source: type === 'user' ? 'file_upload' : 'system',
+    }] })
+    expect(await archiveLinkedSkattekontoUnderlag(supabase, companyId, 'user-1'))
+      .toEqual({ archived: 0, failed: 0 })
+    expect(uploadDocument).not.toHaveBeenCalled()
   })
 
   it('does not duplicate a previously generated document', async () => {

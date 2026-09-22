@@ -165,19 +165,18 @@ export async function archiveLinkedSkattekontoUnderlag(
   const documents = new Map<string, DocumentRow[]>()
   for (let i = 0; i < ids.length; i += LOOKUP_CHUNK) {
     const chunk = ids.slice(i, i + LOOKUP_CHUNK)
-    const [entryResult, documentResult] = await Promise.all([
+    const [entryResult, attachedDocuments] = await Promise.all([
       supabase.from('journal_entries')
         .select('id, status, voucher_series, voucher_number, fiscal_period_id')
         .eq('company_id', companyId).in('id', chunk),
-      supabase.from('document_attachments')
+      fetchAllRows<DocumentRow>(({ from, to }) => supabase.from('document_attachments')
         .select('journal_entry_id, file_name, upload_source')
         .eq('company_id', companyId).eq('is_current_version', true)
-        .in('journal_entry_id', chunk),
+        .in('journal_entry_id', chunk).order('id').range(from, to)),
     ])
     if (entryResult.error) throw entryResult.error
-    if (documentResult.error) throw documentResult.error
     for (const entry of (entryResult.data ?? []) as EntryRow[]) entries.set(entry.id, entry)
-    for (const doc of (documentResult.data ?? []) as DocumentRow[]) {
+    for (const doc of attachedDocuments) {
       const attached = documents.get(doc.journal_entry_id) ?? []
       attached.push(doc)
       documents.set(doc.journal_entry_id, attached)
