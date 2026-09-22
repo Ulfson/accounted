@@ -18,6 +18,7 @@
  * entities completes in a handful of Supabase requests per step.
  */
 
+import { bokioSupplierSource, recordBokioSupplierSources } from './bokio-supplier-source'
 import { chunk } from '@/lib/utils'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { MigrationProgress, MigrationResults, MigrationStepError, SkipReasons } from '../types'
@@ -398,6 +399,7 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
   // Every invoice this run inserted, with the booking voucher the provider
   // named for it. Linked to the SIE-imported registration verifikat after both
   // invoice steps (see the registration-link step below).
+  const bokioSources = new Map<string, ReturnType<typeof bokioSupplierSource>>()
   const registrationLinkInputs: MigratedInvoiceLinkInput[] = []
 
   // Resolve consent to get access token and provider
@@ -1477,10 +1479,13 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             for (const item of mappedBatch[i].items) {
               allItems.push({ ...item, supplier_invoice_id: invoiceId })
             }
+            if (mappedBatch[i].dto.supplierEvidence) bokioSources.set(String(invoiceId), bokioSupplierSource(mappedBatch[i].dto, mappedBatch[i].supplierId))
             registrationLinkInputs.push({
               invoiceId: String(invoiceId),
               kind: 'supplier',
               sourceVoucher: mappedBatch[i].dto.sourceVoucher ?? null,
+              ...(mappedBatch[i].dto.supplierEvidence?.voucherKind === 'cash_purchase'
+                ? { settlement: { sourcePaid: mappedBatch[i].dto.paymentStatus.paid, userId } } : {}),
               refNotFetched: unhydratedIds.has(mappedBatch[i].dto.id),
               invoiceDate: mappedBatch[i].dto.issueDate,
               // What the registration voucher must show: a credit note is
@@ -1603,6 +1608,13 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
           ambiguous: links.ambiguous,
           amountMismatch: links.amountMismatch,
           alreadyLinked: links.alreadyLinked,
+        }
+        const bokioRecords = [...bokioSources].map(([invoiceId, source]) => ({
+          invoice_id: invoiceId, source,
+          voucher_id: links.reports.find(row => row.invoiceId === invoiceId && row.linkType === 'settlement')?.journalEntryId,
+        }))
+        for (const batch of chunk(bokioRecords, 100)) {
+          await recordBokioSupplierSources(supabase, companyId, consentId, batch)
         }
         console.log(
           `[migration] Registration vouchers: ${links.linked} linked, ${links.noRef} without ref, ${links.refNotFetched} ref not fetched, ${links.unresolved} unresolved, `
