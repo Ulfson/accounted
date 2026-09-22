@@ -1,5 +1,6 @@
 import { Document, Page, StyleSheet, Text, View, renderToBuffer } from '@react-pdf/renderer'
 import type { SupabaseClient } from '@supabase/supabase-js'
+import type { DocumentUploadSource } from '@/types'
 import { uploadDocument } from '@/lib/core/documents/document-service'
 import { createLogger } from '@/lib/logger'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
@@ -35,6 +36,7 @@ interface FiscalPeriodRow {
 interface DocumentRow {
   journal_entry_id: string
   file_name: string
+  upload_source: DocumentUploadSource | null
 }
 
 export interface SkattekontoUnderlagModel {
@@ -54,6 +56,7 @@ export function skattekontoUnderlagFilename(rowId: string, journalEntryId: strin
   return `Skattekonto_API_${rowId}_${journalEntryId}.pdf`
 }
 
+/** Preserve the API transaction identity and voucher context in a stable PDF model. */
 export function buildSkattekontoUnderlagModel(
   row: SkattekontoRow,
   entry: EntryRow,
@@ -75,6 +78,7 @@ export function buildSkattekontoUnderlagModel(
   }
 }
 
+/** Format SEK amounts using a minus glyph supported by the PDF font. */
 function formatSek(amount: number): string {
   // Helvetica cannot render the Unicode minus emitted by sv-SE.
   return `${new Intl.NumberFormat('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -82,6 +86,7 @@ function formatSek(amount: number): string {
     .replaceAll(String.fromCharCode(0x2212), '-')} kr`
 }
 
+/** Render an Accounted source summary with deterministic dates for archive retries. */
 export function SkattekontoUnderlagPdf({ model }: { model: SkattekontoUnderlagModel }) {
   // Build styles only when rendering. Routes that mock react-pdf without
   // StyleSheet can import the sync module without creating a PDF.
@@ -157,7 +162,7 @@ export async function archiveLinkedSkattekontoUnderlag(
   const ids = [...new Set(rows.map(row => row.journal_entry_id))]
   const entries = new Map<string, EntryRow>()
   const periods = new Map<string, FiscalPeriodRow>()
-  const documents = new Map<string, Set<string>>()
+  const documents = new Map<string, DocumentRow[]>()
   for (let i = 0; i < ids.length; i += LOOKUP_CHUNK) {
     const chunk = ids.slice(i, i + LOOKUP_CHUNK)
     const [entryResult, documentResult] = await Promise.all([
@@ -165,7 +170,7 @@ export async function archiveLinkedSkattekontoUnderlag(
         .select('id, status, voucher_series, voucher_number, fiscal_period_id')
         .eq('company_id', companyId).in('id', chunk),
       supabase.from('document_attachments')
-        .select('journal_entry_id, file_name')
+        .select('journal_entry_id, file_name, upload_source')
         .eq('company_id', companyId).eq('is_current_version', true)
         .in('journal_entry_id', chunk),
     ])
@@ -173,9 +178,9 @@ export async function archiveLinkedSkattekontoUnderlag(
     if (documentResult.error) throw documentResult.error
     for (const entry of (entryResult.data ?? []) as EntryRow[]) entries.set(entry.id, entry)
     for (const doc of (documentResult.data ?? []) as DocumentRow[]) {
-      const names = documents.get(doc.journal_entry_id) ?? new Set<string>()
-      names.add(doc.file_name)
-      documents.set(doc.journal_entry_id, names)
+      const attached = documents.get(doc.journal_entry_id) ?? []
+      attached.push(doc)
+      documents.set(doc.journal_entry_id, attached)
     }
   }
   const periodIds = [...new Set([...entries.values()].map(entry => entry.fiscal_period_id))]
@@ -192,9 +197,9 @@ export async function archiveLinkedSkattekontoUnderlag(
     if (entry?.status !== 'posted' || entry.voucher_number === null) return false
     const period = periods.get(entry.fiscal_period_id)
     if (!period || period.is_closed || period.locked_at !== null) return false
-    const names = documents.get(row.journal_entry_id)
-    if (names && [...names].some(name => !name.startsWith('Skattekonto_API_'))) return false
-    return !names?.has(skattekontoUnderlagFilename(row.id, row.journal_entry_id))
+    const attached = documents.get(row.journal_entry_id) ?? []
+    if (attached.some(doc => doc.upload_source !== 'system')) return false
+    return !attached.some(doc => doc.file_name === skattekontoUnderlagFilename(row.id, row.journal_entry_id))
   }).slice(0, BATCH_SIZE)
   if (candidates.length === 0) return { archived: 0, failed: 0 }
 

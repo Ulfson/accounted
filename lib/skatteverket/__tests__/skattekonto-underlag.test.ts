@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
+import type { DocumentUploadSource } from '@/types'
 
 const { uploadDocument } = vi.hoisted(() => ({ uploadDocument: vi.fn() }))
 vi.mock('@/lib/core/documents/document-service', () => ({ uploadDocument }))
@@ -30,11 +31,12 @@ const entry = {
 }
 const period = { id: periodId, is_closed: false, locked_at: null as string | null }
 
+/** Project selected columns so provenance tests also cover the document query contract. */
 function makeSupabase(options: {
   rows?: typeof row[]
   entries?: typeof entry[]
   periods?: typeof period[]
-  documents?: Array<{ journal_entry_id: string; file_name: string }>
+  documents?: Array<{ journal_entry_id: string; file_name: string; upload_source: DocumentUploadSource | null }>
 } = {}) {
   const tables: Record<string, Record<string, unknown>[]> = {
     skattekonto_transactions: options.rows ?? [row],
@@ -50,7 +52,11 @@ function makeSupabase(options: {
       queries.push({ table, filters })
       let records = [...(tables[table] ?? [])]
       const builder = {
-        select() { return builder },
+        select(columns: string) {
+          const selected = columns.split(',').map(column => column.trim())
+          records = records.map(record => Object.fromEntries(selected.map(column => [column, record[column]])))
+          return builder
+        },
         eq(column: string, value: unknown) {
           filters.push([column, value])
           // Fixtures omit columns that the service selects only as filters.
@@ -120,16 +126,39 @@ describe('skattekonto underlag', () => {
 
   it('does not replace an existing user-supplied underlag', async () => {
     const { supabase } = makeSupabase({
-      documents: [{ journal_entry_id: entryId, file_name: 'SKV-kontoutdrag.pdf' }],
+      documents: [{ journal_entry_id: entryId, file_name: 'SKV-kontoutdrag.pdf', upload_source: 'file_upload' }],
     })
     expect(await archiveLinkedSkattekontoUnderlag(supabase, companyId, 'user-1'))
       .toEqual({ archived: 0, failed: 0 })
     expect(uploadDocument).not.toHaveBeenCalled()
   })
 
+  it.each(['file_upload', 'api', null] as const)(
+    'preserves a document with a generated-looking filename from source %s', async uploadSource => {
+      const { supabase } = makeSupabase({
+        documents: [{
+          journal_entry_id: entryId, file_name: 'Skattekonto_API_user-statement.pdf',
+          upload_source: uploadSource,
+        }],
+      })
+      expect(await archiveLinkedSkattekontoUnderlag(supabase, companyId, 'user-1'))
+        .toEqual({ archived: 0, failed: 0 })
+      expect(uploadDocument).not.toHaveBeenCalled()
+    },
+  )
+
+  it('allows a missing snapshot alongside an unrelated system-generated document', async () => {
+    const { supabase } = makeSupabase({
+      documents: [{ journal_entry_id: entryId, file_name: 'system-summary.pdf', upload_source: 'system' }],
+    })
+    expect(await archiveLinkedSkattekontoUnderlag(supabase, companyId, 'user-1'))
+      .toEqual({ archived: 1, failed: 0 })
+    expect(uploadDocument).toHaveBeenCalledTimes(1)
+  })
+
   it('does not duplicate a previously generated document', async () => {
     const { supabase } = makeSupabase({
-      documents: [{ journal_entry_id: entryId, file_name: skattekontoUnderlagFilename(rowId, entryId) }],
+      documents: [{ journal_entry_id: entryId, file_name: skattekontoUnderlagFilename(rowId, entryId), upload_source: 'system' }],
     })
     expect(await archiveLinkedSkattekontoUnderlag(supabase, companyId, 'user-1'))
       .toEqual({ archived: 0, failed: 0 })
@@ -145,7 +174,7 @@ describe('skattekonto underlag', () => {
     }
     const { supabase } = makeSupabase({
       rows: [row, secondRow],
-      documents: [{ journal_entry_id: entryId, file_name: skattekontoUnderlagFilename(rowId, entryId) }],
+      documents: [{ journal_entry_id: entryId, file_name: skattekontoUnderlagFilename(rowId, entryId), upload_source: 'system' }],
     })
     expect(await archiveLinkedSkattekontoUnderlag(supabase, companyId, 'user-1'))
       .toEqual({ archived: 1, failed: 0 })
