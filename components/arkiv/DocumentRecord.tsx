@@ -23,9 +23,10 @@ import { useFieldLabel } from './useFieldLabel'
  * artboard Avtal, applied to a document): what it is, what was read from it
  * with its page, the rows of a receipt or invoice, and what it is tied to.
  * A field that became a fact about the company says so on its row instead
- * of being listed twice.
+ * of being listed twice. `initialPage` (from a search hit) opens the text
+ * at that page.
  */
-export function DocumentRecord({ documentId }: { documentId: string }) {
+export function DocumentRecord({ documentId, initialPage = null }: { documentId: string; initialPage?: number | null }) {
   const t = useTranslations('arkiv')
   const locale = useLocale()
   const fieldLabel = useFieldLabel()
@@ -44,6 +45,32 @@ export function DocumentRecord({ documentId }: { documentId: string }) {
     const { data } = (await res.json()) as { data: DocumentRecordView }
     return data
   }, [documentId])
+  const [reading, setReading] = useState(false)
+
+  const loadText = () => {
+    setReading(true)
+    return fetch(`/api/documents/${documentId}/text`)
+      .then(async (res) => (res.ok ? ((await res.json()) as { data: DocumentTextView }).data : null))
+      .then((data) => {
+        if (data) {
+          setText(data)
+          setTextOpen(true)
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => setReading(false))
+  }
+
+  useEffect(() => {
+    if (initialPage) void loadText()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [documentId, initialPage])
+
+  // The page is on screen only once both the record and its text are: the text is the smaller fetch and lands first.
+  useEffect(() => {
+    if (!initialPage || !view || !text || !textOpen) return
+    document.getElementById(`arkiv-page-${initialPage}`)?.scrollIntoView({ block: 'start' })
+  }, [initialPage, view, text, textOpen])
 
   useEffect(() => {
     let cancelled = false
@@ -216,27 +243,26 @@ export function DocumentRecord({ documentId }: { documentId: string }) {
           )}
           <Section title={t('record_text')} help={t('record_text_help')}>
             {!text ? (
-              <button
-                type="button"
-                className="text-xs text-muted-foreground underline decoration-border underline-offset-2 hover:text-foreground"
-                onClick={() => {
-                  fetch(`/api/documents/${documentId}/text`)
-                    .then(async (res) => (res.ok ? ((await res.json()) as { data: DocumentTextView }).data : null))
-                    .then((data) => {
-                      if (data) {
-                        setText(data)
-                        setTextOpen(true)
-                      }
-                    })
-                    .catch(() => undefined)
-                }}
-              >
-                {t('record_text_show')}
-              </button>
+              <div className="space-y-1.5">
+                {view.read.state !== 'read' ? (
+                  <p className="text-[12.5px] text-muted-foreground">
+                    {t(`record_text_${view.read.state}` as never)}
+                    {view.read.lane === 'history_tied' ? ` ${t('record_text_lane_tied')}` : ''}
+                  </p>
+                ) : null}
+                <button
+                  type="button"
+                  disabled={reading}
+                  className="text-xs text-muted-foreground underline decoration-border underline-offset-2 hover:text-foreground disabled:opacity-50"
+                  onClick={() => void loadText()}
+                >
+                  {reading ? t('record_text_reading') : view.read.state === 'read' ? t('record_text_show') : t('record_text_read_now')}
+                </button>
+              </div>
             ) : (
               <div className="space-y-4">
                 {(textOpen ? text.pages : text.pages.slice(0, 1)).map((p) => (
-                  <div key={p.page_no}>
+                  <div key={p.page_no} id={`arkiv-page-${p.page_no}`} className={p.page_no === initialPage ? 'scroll-mt-4 border-l-2 border-foreground pl-3' : undefined}>
                     {text.pages.length > 1 ? (
                       <div className="mb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{t('source_page_short_only', { page: p.page_no })}</div>
                     ) : null}

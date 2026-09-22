@@ -4,6 +4,8 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { getAiService, getAiStatus } from '@/lib/ai'
 import { recordActivity, softwareAgent } from '@/lib/documents/provenance'
 import { captureArkivEvent } from '@/lib/arkiv/events'
+import { recordArkivUsage } from '@/lib/arkiv/usage'
+import { ensureDocumentRead } from '@/lib/documents/read/on-demand'
 import { locateQuote, type PageText } from '@/lib/documents/extract/locate'
 import type { WordBox } from '@/lib/documents/read/types'
 
@@ -143,6 +145,8 @@ export async function askDocument(
       file_name: string
       page_count: number | null
     }
+    // History the lanes left unread or half read is read now: a question is what it waited for.
+    await ensureDocumentRead(supabase, input.companyId, input.documentId)
     const { data: rows, error: pagesError } = await supabase
       .from('document_pages')
       .select('page_no, text, words')
@@ -209,6 +213,7 @@ export async function askDocument(
         pages_sent: sent.map((p) => p.pageNo),
       },
     })
+    await recordArkivUsage(supabase, input.companyId, 'asks', 1)
     captureArkivEvent('arkiv_document_asked', { companyId: input.companyId, answered: !notFound, pages_sent: sent.length, agent: input.askedBy.agentName })
     return {
       status: 'answered',
