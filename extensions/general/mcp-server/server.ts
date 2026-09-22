@@ -31,7 +31,7 @@ import {
   type ApiKeyScope,
 } from '@/lib/auth/api-keys'
 import { checkRateLimit } from '@/lib/auth/rate-limit-http'
-import { getCanonicalBaseUrl } from '@/lib/api/v1/base-url'
+import { getCanonicalBaseUrl, resolveDiscoveryBaseUrl } from '@/lib/api/v1/base-url'
 import { createCompanyCore } from '@/lib/company/create-company'
 import {
   AssetCorrectionBlockedError,
@@ -331,6 +331,7 @@ import {
   findMatchingVouchersForSupplierInvoice,
   validateVoucherForSupplierInvoiceLink,
 } from '@/lib/invoices/supplier-voucher-matching'
+import { resolveSupplierSettlementSide } from '@/lib/invoices/supplier-settlement-side'
 import { findFiscalPeriod, getSwedishLocalDate, validateBalance } from '@/lib/bookkeeping/engine'
 import { countUnbookedInPeriod, findNextPeriod, lockPeriod, resolvePeriodStatusForDate, type PeriodStatusForDate } from '@/lib/core/bookkeeping/period-service'
 import { validateYearEndReadiness, previewYearEndClosing } from '@/lib/core/bookkeeping/year-end-service'
@@ -377,6 +378,8 @@ import {
   DOCUMENTS_BUCKET,
 } from '@/lib/core/documents/document-service'
 import { toSameOriginStorageUrl } from '@/lib/core/documents/storage-proxy'
+import { createArkivTools } from './arkiv-tools'
+import { isArkivEnabled } from '@/lib/arkiv/flag'
 import { createHash } from 'node:crypto'
 import { extractInvoiceFields, ExtractionSchema as InvoiceExtractionSchema, AgentExtractionSchema, fetchOwnCompanyIdentity } from '@/extensions/general/invoice-inbox/lib/extract-invoice-fields'
 import { mirrorExtractionToDocument } from '@/extensions/general/invoice-inbox/lib/mirror-extraction'
@@ -384,7 +387,7 @@ import { mirrorExtractionToDocument } from '@/extensions/general/invoice-inbox/l
 // pattern as invoice-inbox above: the CI guard only checks lib/, app/api/,
 // components/. The two submit tools stage ops whose commit dispatches back into
 // the skatteverket extension via the registry (lib/pending-operations/commit.ts).
-import { skvRequest, SkatteverketAuthError } from '@/extensions/general/skatteverket/lib/api-client'
+import { skvRequest, SkatteverketAuthError, isApigwClientRefusal } from '@/extensions/general/skatteverket/lib/api-client'
 import { agiGetKvittenser } from '@/extensions/general/skatteverket/lib/agi-client'
 import { readAgiSubmissionStatus } from '@/extensions/general/skatteverket/lib/agi-submission-status'
 import { buildMomsuppgift, resolveRedovisare, resolveRedovisningsperiod } from '@/extensions/general/skatteverket/lib/declaration-prep'
@@ -536,7 +539,7 @@ function resolveInvoiceLineFromArticle(
   }
 }
 
-interface ActorContext {
+export interface ActorContext {
   // 'anonymous': a client that has not connected an account yet (lazy
   // authentication, issue #1814). Only PUBLIC_TOOLS ever run under it.
   type: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'anonymous'
@@ -585,7 +588,7 @@ interface JsonRpcResponse {
 
 // ── MCP Tool definition ──────────────────────────────────────
 
-interface McpToolAnnotations {
+export interface McpToolAnnotations {
   readOnlyHint?: boolean
   destructiveHint?: boolean
   idempotentHint?: boolean
@@ -724,7 +727,7 @@ function duplicateCandidateRefusal(
   )
 }
 
-interface McpTool {
+export interface McpTool {
   name: string
   // Top-level Tool.title per MCP spec 2025-06-18 (human-facing label for
   // directory listings; distinct from annotations.title). Short Title Case
@@ -816,10 +819,39 @@ function resolveMcpDocumentMimeType(fileName: string, requestedMimeType: unknown
 
 interface DocumentInboxResult {
   document_id: string
-  inbox_item_id: string
+  inbox_item_id: string | null
   status: string
   extracted_data: Record<string, unknown>
   matched_supplier_id: string | null
+  /** The bytes were already in the archive: this is the existing document, nothing new was created. */
+  deduplicated?: boolean
+}
+
+/**
+ * The same bytes uploaded again land on the document the archive already
+ * holds, and the answer says so instead of minting a second inbox item. The
+ * first rollout company had one filing uploaded eight times before this;
+ * the nightly lint found the copies, the upload never did.
+ */
+async function alreadyArchivedResult(supabase: SupabaseClient, companyId: string, documentId: string): Promise<DocumentInboxResult> {
+  const { data, error } = await supabase
+    .from('invoice_inbox_items')
+    .select('id, status, extracted_data, matched_supplier_id')
+    .eq('company_id', companyId)
+    .eq('document_id', documentId)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle()
+  if (error) throw new Error(`Failed to look up the archived document's inbox item: ${error.message}`)
+  const item = data as { id: string; status: string; extracted_data: Record<string, unknown> | null; matched_supplier_id: string | null } | null
+  return {
+    document_id: documentId,
+    inbox_item_id: item?.id ?? null,
+    status: item?.status ?? 'archived',
+    extracted_data: item?.extracted_data ?? {},
+    matched_supplier_id: item?.matched_supplier_id ?? null,
+    deduplicated: true,
+  }
 }
 
 async function findCompletedDocumentInboxItem(
@@ -2172,6 +2204,11 @@ const SKV_AGI_STATUS_OUTPUT_SCHEMA = {
       description: 'Run-scoped cached submission record; null when the period record belongs to a sibling run.',
     },
     kvittenser: { type: ['array', 'null'], description: 'Signed receipts from Skatteverket, or null when unavailable' },
+    kvittens_read: {
+      type: 'string',
+      enum: ['ok', 'unavailable'],
+      description: "unavailable: Skatteverket refuses receipt reads for this installation, so filing_state cannot reach signed. Stop polling; the user verifies the filing in Skatteverket's Arbetsgivardeklaration e-service.",
+    },
   },
   required: ['salary_run_id', 'period', 'filing_state', 'kvittensnummer', 'local_state', 'kvittenser'],
 } as const
@@ -3925,7 +3962,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         tools: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -3981,27 +4017,33 @@ export const tools: McpTool[] = [
         // exact keyword > per-term name/keyword hits > description hits. Ties
         // fall back to definition order (stable).
         const terms = query.split(/\s+/).filter(Boolean)
-        const ranked = candidates
-          .map((t, idx) => {
-            const name = t.name.toLowerCase()
-            const desc = t.description.toLowerCase()
-            const kw = (t.keywords ?? []).map((k) => k.toLowerCase())
-            const kwText = kw.join(' ')
-            const hay = `${name} ${desc} ${kwText}`
-            if (!terms.every((term) => hay.includes(term))) return null
-            let score = 0
-            if (name === query || name === `gnubok_${query}` || name.endsWith(`_${query}`)) score += 100
-            if (name.includes(query)) score += 40
-            if (kw.includes(query)) score += 40
-            for (const term of terms) {
-              if (name.includes(term)) score += 10
-              if (kwText.includes(term)) score += 10
-              if (desc.includes(term)) score += 1
-            }
-            return { t, score, idx }
-          })
-          .filter((x): x is { t: McpTool; score: number; idx: number } => x !== null)
-          .sort((a, b) => b.score - a.score || a.idx - b.idx)
+        const rank = (matches: (hay: string) => boolean) =>
+          candidates
+            .map((t, idx) => {
+              const name = t.name.toLowerCase()
+              const desc = t.description.toLowerCase()
+              const kw = (t.keywords ?? []).map((k) => k.toLowerCase())
+              const kwText = kw.join(' ')
+              if (!matches(`${name} ${desc} ${kwText}`)) return null
+              let score = 0
+              if (name === query || name === `gnubok_${query}` || name.endsWith(`_${query}`)) score += 100
+              if (name.includes(query)) score += 40
+              if (kw.includes(query)) score += 40
+              for (const term of terms) {
+                if (name.includes(term)) score += 10
+                if (kwText.includes(term)) score += 10
+                if (desc.includes(term)) score += 1
+              }
+              return { t, score, idx }
+            })
+            .filter((x): x is { t: McpTool; score: number; idx: number } => x !== null)
+            .sort((a, b) => b.score - a.score || a.idx - b.idx)
+        let ranked = rank((hay) => terms.every((term) => hay.includes(term)))
+        // An agent often sends a bag of words ("arkiv graph source links"); no
+        // single tool holds them all, and an empty answer reads as "no such
+        // tools". When every-term finds nothing, any-term does, ranked by the
+        // same per-term score so the tools holding most of the words lead.
+        if (ranked.length === 0 && terms.length > 1) ranked = rank((hay) => terms.some((term) => hay.includes(term)))
         candidates = ranked.map((x) => x.t)
       }
 
@@ -4075,7 +4117,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         companies: {
           type: 'array',
@@ -4738,7 +4779,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         provider: { type: 'string' },
         provider_name: { type: 'string' },
@@ -4792,7 +4832,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         company_id: { type: 'string' },
         bank_name: { type: ['string', 'null'] },
@@ -5045,7 +5084,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         skills: {
           type: 'array',
@@ -5161,7 +5199,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         slug: { type: 'string' },
         name: { type: 'string' },
@@ -5236,7 +5273,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         id: { type: 'string', description: 'Deprecated: read fact_id instead' },
         fact_id: { type: 'string' },
@@ -5333,7 +5369,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         id: { type: 'string', description: 'Deprecated: read fact_id instead' },
         fact_id: { type: 'string' },
@@ -5391,7 +5426,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         recorded: { type: 'boolean' },
         message: { type: 'string' },
@@ -5467,7 +5501,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         company: {
           type: 'object',
@@ -5556,6 +5589,19 @@ export const tools: McpTool[] = [
           },
           required: ['tool', 'when', 'include'],
         },
+        arkiv: {
+          type: 'object',
+          additionalProperties: false,
+          description: 'Present when the company is in the Arkiv rollout: how much of the archive is structured, how to read it, and stable refs to start from.',
+          properties: {
+            documents: { type: 'integer' },
+            agreements: { type: 'integer' },
+            facts: { type: 'integer' },
+            instructions: { type: 'string' },
+            anchors: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { record_ref: { type: 'string' }, title: { type: 'string' } }, required: ['record_ref', 'title'] } },
+          },
+          required: ['documents', 'agreements', 'facts', 'instructions', 'anchors'],
+        },
         skatteverket_connection: {
           type: 'object',
           description:
@@ -5634,6 +5680,35 @@ export const tools: McpTool[] = [
                 last_booked: s.evidence.last_booked,
               },
             })),
+          }
+        } catch {
+          return null
+        }
+      })()
+
+      // Arkiv digest: only for companies in the rollout, best-effort, and
+      // short by design (the stanza stays under 1 500 tokens): counts, how
+      // to read the record, and a few refs to start from.
+      const safeArkivDigest = (async () => {
+        if (!isArkivEnabled(companyId)) return null
+        try {
+          const [documents, agreements, facts, anchors] = await Promise.all([
+            supabase.from('document_attachments').select('id', { count: 'exact', head: true }).eq('company_id', companyId).eq('admission_state', 'admitted'),
+            supabase.from('agreements').select('id', { count: 'exact', head: true }).eq('company_id', companyId),
+            supabase.from('company_facts').select('id', { count: 'exact', head: true }).eq('company_id', companyId).is('sys_to', null).neq('rank', 'deprecated').eq('status', 'confirmed'),
+            supabase.from('agreements').select('id, title').eq('company_id', companyId).eq('status', 'active').order('ends_on', { ascending: true, nullsFirst: false }).limit(5),
+          ])
+          if (documents.error || agreements.error || facts.error || anchors.error) return null
+          return {
+            documents: documents.count ?? 0,
+            agreements: agreements.count ?? 0,
+            facts: facts.count ?? 0,
+            instructions:
+              'Arkiv holds every document as a record with page citations. Read the resource Accounted://arkiv/map first: what the archive holds, running agreements, registered facts, what waits. For anything about a contract, registration, decision or what a document says: gnubok_search_records, then gnubok_get_record on the record_ref; gnubok_ask_document answers one question from the text with page and quote (journal_entry:<id> returns every attachment of a verifikat as a record). Cite the page you read from; gnubok_get_source shows the page text. Facts carry validity and belief windows: gnubok_get_fact_history when values changed. Never state a value the record does not hold; propose a correction with gnubok_propose_fact and let a person approve it. Accounted://arkiv/missing lists documents the books expect but the archive lacks, with evidence and the intake address to forward to; gather them with the person and close each with gnubok_resolve_missing. Accounted://arkiv/graph is the whole company as one graph with record references and evidence on every link; gnubok_get_neighbourhood (via gnubok_call_tool) walks the hops around one node.',
+            anchors: [
+              { record_ref: `company:${companyId}`, title: 'Bolagets fakta (subject_ref för gnubok_get_fact_history)' },
+              ...((anchors.data ?? []) as Array<{ id: string; title: string }>).map((a) => ({ record_ref: `agreement:${a.id}`, title: a.title })),
+            ],
           }
         } catch {
           return null
@@ -5876,6 +5951,7 @@ export const tools: McpTool[] = [
 
       const ledgerDigest = await safeLedgerDigest
       const skvConnection = await safeSkvConnection
+      const arkivDigest = await safeArkivDigest
 
       return {
         company,
@@ -5891,6 +5967,7 @@ export const tools: McpTool[] = [
         })),
         ...(dimensionsBlock ? { dimensions: dimensionsBlock } : {}),
         ...(ledgerDigest ? { ledger_context: ledgerDigest } : {}),
+        ...(arkivDigest ? { arkiv: arkivDigest } : {}),
         ...(skvConnection ? { skatteverket_connection: skvConnection } : {}),
 
         // Static per-workflow loadouts (issue #1098): lets a deferred-loading
@@ -5924,7 +6001,6 @@ export const tools: McpTool[] = [
     description: 'Stage bank/cash-account transactions; each becomes a pending operation. For external rows (Airtable, CSV); max 10. A transaction models a cash-account movement: for cashless events (privat utlägg) use gnubok_create_voucher.',
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         staged_count: { type: 'number', description: 'Number of items successfully staged.' },
         operations: {
@@ -6326,7 +6402,7 @@ export const tools: McpTool[] = [
     catalogVisibility: 'search',
     keywords: ['kvittojakten', 'kvitto', 'underlag', 'saknar underlag', 'mail'],
     title: 'Kvittojakten Worklist',
-    description: 'What lacks an underlag, shaped for a mail search: posted verifikat and unbooked purchases, largest first, with counterparty, amount, date window, portal hint and the inbox address to forward to. Load skill kvittojakten first.',
+    description: 'What lacks an underlag, shaped for a mail search: posted verifikat and unbooked purchases, largest first, with counterparty, amount, date window, portal hint, the inbox address to forward to and a next step per item. Load skill kvittojakten first.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -6337,7 +6413,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         items: {
           type: 'array',
@@ -6367,6 +6442,8 @@ export const tools: McpTool[] = [
                   note: { type: ['string', 'null'] },
                 },
               },
+              tip_possible: { type: 'boolean', description: 'Restaurant or bar: the charge is the bill plus a tip, so a receipt up to a quarter smaller is still this purchase.' },
+              next_step: { type: 'string', description: 'One Swedish sentence for the user when the document cannot be fetched: where the receipt is and what to do. Report it verbatim.' },
             },
           },
         },
@@ -6611,7 +6688,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         transactions: { type: 'array', items: { type: 'object' } },
         categories: { type: 'array', items: { type: 'string' } },
@@ -6658,7 +6734,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         customers: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -7128,7 +7203,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         articles: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -7434,7 +7508,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         invoice_id: { type: 'string' },
         invoice_number: { type: ['string', 'null'], description: 'null until sent' },
@@ -7996,7 +8069,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         ...SALES_ORDER_SUMMARY_PROPS,
         source_invoice_id: { type: ['string', 'null'], description: 'Proforma or offert the order was converted from, if any' },
@@ -8589,7 +8661,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         rows: { type: 'array', items: { type: 'object' } },
         total_debit: { type: 'number' },
@@ -8733,7 +8804,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         period: { type: 'object' },
         period_label: { type: 'string' },
@@ -9055,7 +9125,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         deliveries: {
           type: 'array',
@@ -9236,7 +9305,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         suppliers: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -9290,7 +9358,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         party: { type: ['object', 'null'] },
         found: { type: 'boolean' },
@@ -9482,7 +9549,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         invoices: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -9636,7 +9702,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         templates: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -9686,7 +9751,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         suggestions: { type: 'object' },
         counterparty_matches: { type: 'object' },
@@ -9834,7 +9898,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         accounts: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -10144,7 +10207,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         dimensions: {
           type: 'array',
@@ -10226,7 +10288,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         dimension: {
           type: 'object',
@@ -10781,7 +10842,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         dimension: {
           type: 'object',
@@ -11026,7 +11086,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         lines: { type: 'array', items: { type: 'object' } },
         truncated: { type: 'boolean', description: 'True if more matching lines exist than were returned' },
@@ -12618,7 +12677,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         invoice_id: { type: 'string' },
         invoice_status: { type: 'string' },
@@ -12761,7 +12819,7 @@ export const tools: McpTool[] = [
     name: 'gnubok_find_voucher_candidates_for_supplier_invoice',
     keywords: ['verifikat', 'koppla'],
     title: 'Find Voucher Candidates (Supplier Invoice)',
-    description: 'List posted verifikat that debit leverantörsskuld (2440) and could be this supplier invoice\'s payment. Call before gnubok_link_supplier_invoice_to_voucher to mark the leverantörsfaktura paid (no new bokföring).',
+    description: "List posted verifikat that could be this supplier invoice's payment (debit 244x; kontantmetoden with no registration verifikat: credit 19xx). Call before gnubok_link_supplier_invoice_to_voucher to mark the leverantörsfaktura paid (no new bokföring).",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -12773,10 +12831,10 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         supplier_invoice_id: { type: 'string' },
         invoice_status: { type: 'string' },
+        settlement_side: { type: 'string', enum: ['ap_debit', 'bank_credit'] },
         candidates: { type: 'array', items: { type: 'object' } },
       },
       required: ['supplier_invoice_id', 'candidates'],
@@ -12805,15 +12863,17 @@ export const tools: McpTool[] = [
         }
       }
 
+      const settlementSide = await resolveSupplierSettlementSide(supabase, companyId, supplierInvoiceId)
       const candidates = await findMatchingVouchersForSupplierInvoice(
         supabase,
         companyId,
         invoice as never,
-        { limit },
+        { limit, settlementSide },
       )
       return {
         supplier_invoice_id: supplierInvoiceId,
         invoice_status: invoice.status,
+        settlement_side: settlementSide.side,
         candidates,
       }
     },
@@ -12823,7 +12883,7 @@ export const tools: McpTool[] = [
     name: 'gnubok_link_supplier_invoice_to_voucher',
     keywords: ['koppla leverantörsfaktura', 'verifikat'],
     title: 'Link Supplier Invoice to Voucher',
-    description: 'Markera en leverantörsfaktura som betald via länk till en befintlig verifikation som debiterar leverantörsskuld (2440). Skapar ingen ny verifikation. Kör gnubok_find_voucher_candidates_for_supplier_invoice först. Stages.',
+    description: 'Markera en leverantörsfaktura som betald via länk till en befintlig verifikation (debiterar 244x; kontantmetoden utan registreringsverifikat: krediterar 19xx). Skapar ingen ny verifikation. Kör gnubok_find_voucher_candidates_for_supplier_invoice först. Stages.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -12888,6 +12948,7 @@ export const tools: McpTool[] = [
           voucher_date: validation.voucher.entry_date,
           voucher_description: validation.voucher.description,
           ap_debit_amount: validation.apDebitAmount,
+          settlement_side: validation.settlementSide,
           payment_amount: validation.paymentAmount,
           will_be_fully_paid: validation.isFullyPaid,
           remaining_after: validation.remainingAfter,
@@ -12921,7 +12982,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         dry_run: { type: 'boolean' },
         confidence_threshold: { type: 'number' },
@@ -13102,7 +13162,6 @@ export const tools: McpTool[] = [
     inputSchema: { type: 'object', additionalProperties: false, properties: {} },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         periods: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -13817,7 +13876,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         cash_accounts: {
           type: 'array',
@@ -13908,7 +13966,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         upload_id: { type: 'string' },
         upload_url: { type: 'string' },
@@ -13972,15 +14029,15 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         document_id: { type: 'string' },
-        inbox_item_id: { type: 'string' },
+        inbox_item_id: { type: ['string', 'null'], description: 'Null when the bytes were already archived without an inbox item.' },
         status: { type: 'string' },
         extracted_data: { type: 'object' },
         matched_supplier_id: { type: ['string', 'null'] },
+        deduplicated: { type: 'boolean', description: 'True when the same bytes were already in the archive: document_id is the existing document and nothing new was created.' },
       },
-      required: ['document_id', 'inbox_item_id', 'status'],
+      required: ['document_id', 'status'],
     },
     annotations: ANNOTATIONS_IDEMPOTENT_WRITE,
     async execute(args, companyId, userId, supabase) {
@@ -14004,15 +14061,16 @@ export const tools: McpTool[] = [
         fileName,
         mimeType,
         undefined,
-        { extractionOwner: 'invoice-inbox' },
+        { extractionOwner: 'invoice-inbox', dedupeByContent: true },
       )
+      if (completed.document.deduplicated) return alreadyArchivedResult(supabase, companyId, completed.document.id)
       return createDocumentInboxItem(
         supabase,
         companyId,
         userId,
         completed.document.id,
         fileName,
-        mimeType,
+        completed.document.mime_type ?? mimeType,
         Buffer.from(completed.buffer),
         uploadId,
       )
@@ -14036,7 +14094,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         document_id: { type: 'string' },
         inbox_item_id: { type: 'string' },
@@ -14068,7 +14125,7 @@ export const tools: McpTool[] = [
         userId,
         doc.id,
         fileName,
-        mimeType,
+        doc.mime_type ?? mimeType,
         buffer,
       )
     },
@@ -14096,7 +14153,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         items: {
           type: 'array',
@@ -14835,7 +14891,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         items: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -15012,7 +15067,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         document_id: { type: 'string' },
         file_name: { type: 'string' },
@@ -15553,7 +15607,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         trips: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -15792,7 +15845,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         employees: { type: 'array', items: { type: 'object' } },
         count: { type: 'number' },
@@ -16489,12 +16541,27 @@ export const tools: McpTool[] = [
         // leaves kvittenser null rather than hard-failing the status check;
         // auth errors throw and map to SKATTEVERKET_NOT_CONNECTED.
         let kvittenser: unknown = null
-        const res = await agiGetKvittenser({ mode: 'user', supabase, userId, companyId }, arbetsgivare, period)
-        await writeSkatteverketAudit(ctx, {
-          endpoint: 'kvittenser', agRegistreradId: arbetsgivare, redovisningsperiod: period,
-          outcome: res.ok ? 'ok' : 'skv_error', responseStatus: res.status,
-        })
-        if (res.ok) kvittenser = res.data.kvittenser
+        // Skatteverket's gateway refusing the APIGW client (#2226) is an
+        // installation-level state, not this caller's authorisation: failing
+        // the whole status read with SKATTEVERKET_ACCESS_DENIED told the agent
+        // to send the user off to fix a behörighet that is not the problem,
+        // and hid the local filing state it had already resolved.
+        let kvittensRead: 'ok' | 'unavailable' = 'ok'
+        try {
+          const res = await agiGetKvittenser({ mode: 'user', supabase, userId, companyId }, arbetsgivare, period)
+          await writeSkatteverketAudit(ctx, {
+            endpoint: 'kvittenser', agRegistreradId: arbetsgivare, redovisningsperiod: period,
+            outcome: res.ok ? 'ok' : 'skv_error', responseStatus: res.status,
+          })
+          if (res.ok) kvittenser = res.data.kvittenser
+        } catch (err) {
+          if (!isApigwClientRefusal(err)) throw err
+          kvittensRead = 'unavailable'
+          await writeSkatteverketAudit(ctx, {
+            endpoint: 'kvittenser', agRegistreradId: arbetsgivare, redovisningsperiod: period,
+            outcome: 'auth_error', responseStatus: 401,
+          })
+        }
         return {
           salary_run_id: salaryRunId,
           period,
@@ -16504,6 +16571,7 @@ export const tools: McpTool[] = [
           // (the agent must not read a sibling run's receipt as this one's).
           local_state: ownSubmission,
           kvittenser,
+          kvittens_read: kvittensRead,
         }
       } catch (err) {
         throw mapSkatteverketError(err)
@@ -16526,7 +16594,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         employee_id: { type: 'string' },
         first_name: { type: 'string' },
@@ -16626,7 +16693,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         salary_run_employee_id: { type: 'string' },
         salary_run_id: { type: 'string' },
@@ -16726,7 +16792,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         absence_days: { type: 'array', items: { type: 'object' }, description: 'Each with salary_absence_day_id' },
         count: { type: 'number' },
@@ -17625,7 +17690,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         employee_vacation_balance_id: { type: 'string' },
         employee_id: { type: 'string' },
@@ -17670,7 +17734,7 @@ export const tools: McpTool[] = [
       const { dayValueSek } = await import('@/lib/salary/semesterberedning')
       const { data: employee, error: empErr } = await supabase
         .from('employees')
-        .select('vacation_rule, vacation_days_per_year, vacation_pay_rate, semestertillagg_rate, salary_type, monthly_salary, hourly_rate, hours_per_week, workdays_per_week')
+        .select('vacation_rule, vacation_days_per_year, vacation_pay_rate, semestertillagg_rate, salary_type, monthly_salary, employment_degree, hourly_rate, hours_per_week, workdays_per_week')
         .eq('id', employeeId)
         .eq('company_id', companyId)
         .maybeSingle()
@@ -18075,7 +18139,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         content: { type: 'string' },
         byte_size: { type: 'number' },
@@ -18149,7 +18212,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         deduction_type: { type: 'string' },
         eligible: { type: 'array', items: { type: 'object' } },
@@ -18559,7 +18621,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         imported: { type: 'number' },
         already_imported: { type: 'number' },
@@ -18634,7 +18695,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         download_url: { type: ['string', 'null'], description: 'Signed download URL, valid 1 hour, on the app origin (direct Storage URL only when NEXT_PUBLIC_APP_URL is unset); null when estimate_only=true.' },
         storage_path: { type: ['string', 'null'] },
@@ -18786,7 +18846,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         period: { type: 'object' },
         ready: { type: 'boolean' },
@@ -19233,7 +19292,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         gaps: { type: 'array', items: { type: 'object' } },
         total_gaps: { type: 'number' },
@@ -20326,7 +20384,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         upload_id: { type: 'string' },
         upload_url: { type: 'string' },
@@ -21758,7 +21815,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         assets: { type: 'array', items: ASSET_TOOL_ITEM_SCHEMA },
         count: { type: 'number' },
@@ -21789,7 +21845,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         asset: ASSET_TOOL_ITEM_SCHEMA,
         depreciation_schedule: {
@@ -22321,7 +22376,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         status: { type: 'string', enum: ['committed', 'rejected', 'failed'] },
         operation_id: { type: 'string' },
@@ -22474,7 +22528,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         status: { type: 'string', enum: ['rejected'] },
         operation_id: { type: 'string' },
@@ -22589,7 +22642,6 @@ export const tools: McpTool[] = [
     },
     outputSchema: {
       type: 'object',
-      additionalProperties: false,
       properties: {
         inbox_item_id: { type: 'string' },
         matched_supplier_id: { type: ['string', 'null'] },
@@ -23295,6 +23347,7 @@ export const tools: McpTool[] = [
       )
     },
   },
+  ...createArkivTools({ readOnly: ANNOTATIONS_READ_ONLY, stagedWrite: ANNOTATIONS_STAGED_WRITE, stagedSchema: STAGED_OPERATION_SCHEMA, stagePendingOperation }),
 ]
 
 // Drift guard for the gnubok_get_agent_briefing recommended_tools loadouts:
@@ -23718,8 +23771,18 @@ function emitWorkflowStarted(payload: {
  */
 export async function handleMcpRequest(request: Request): Promise<Response> {
   const toolNamespace = resolveMcpToolNamespace(request)
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
-  const resourceMetadataUrl = new URL('/.well-known/oauth-protected-resource', appUrl)
+  // The challenge must name the metadata document on the SAME host the client
+  // called. Pinned to NEXT_PUBLIC_APP_URL it broke every OAuth attempt against
+  // app.gnubok.se, the machine host existing connectors are configured with:
+  // the 401 pointed at app.accounted.se while the document served on
+  // app.gnubok.se names itself, and clients refuse the mismatch ("Protected
+  // resource ... does not match expected"). resolveDiscoveryBaseUrl is what
+  // the metadata route itself uses, so header and document always agree, and
+  // it reflects allowlisted hosts only: a spoofed Host falls back to canonical.
+  const resourceMetadataUrl = new URL(
+    '/.well-known/oauth-protected-resource',
+    resolveDiscoveryBaseUrl(request),
+  )
   if (toolNamespace === 'accounted') {
     resourceMetadataUrl.searchParams.set('tool_namespace', 'accounted')
   }

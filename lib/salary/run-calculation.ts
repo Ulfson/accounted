@@ -30,6 +30,13 @@ import { calculateSalary, monthlyBaseSalary } from './calculation-engine'
 import { SalaryCalculationPolicySchema } from './calculation-policy'
 import { isAutomaticVacationLine, VACATION_COMPENSATION_SOURCE } from './calculated-line-items'
 import { validateOneOffTaxLine } from './one-off-tax'
+import {
+  benefitPaymentRefusalDetails,
+  collectDescribedLines,
+  describeDoubleBenefitAdjustments,
+  doubleBenefitAdjustmentWarning,
+  resolveTaxableBenefits,
+} from './benefit-payments'
 import { loadPayrollConfig, serializePayrollConfig } from './payroll-config'
 import { fetchAllTaxTableRatesForRun, TaxTableUnavailableError } from './tax-tables'
 import { loadAndDeriveAbsence } from './derive-absence-line-items'
@@ -39,7 +46,7 @@ import { recurringLineFlags, type RecurringLineItemType } from './recurring-line
 import { computePremiumLines } from './shift-premium-engine'
 import { roundOre } from '@/lib/money'
 import { computePriorYtd, loadOpeningBalances } from './ytd'
-import { dailyDivisor, hourlyDivisor } from './work-schedule'
+import { dailyDivisor, degreeAdjustedMonthlySalary, hourlyDivisor, scheduledHoursPerDay } from './work-schedule'
 import type { WorkedDayShift } from './shift-premium-engine'
 import type { Logger } from '@/lib/logger'
 import type { SalaryLineItemType, ShiftPremiumRule, ShiftPremiumItemType } from '@/types'
@@ -71,19 +78,23 @@ const DERIVED_PREMIUM_TYPES: ShiftPremiumItemType[] = [
 /**
  * Effective hourly rate used as the base for shift-premium computation.
  *   - Hourly employees: their stored hourly_rate.
- *   - Monthly employees: monthly_salary / hourlyDivisor(hours_per_week):
- *     173 at the 40h default (common Swedish derivation for full-time
- *     monthly → hourly, matches the timlön conventions used in CBAs), the
- *     exact 52w formula for other schedules (arbetsschema-lite).
+ *   - Monthly employees: degree-adjusted monthly salary /
+ *     hourlyDivisor(hours_per_week): 173 at the 40h default (common Swedish
+ *     derivation for full-time monthly → hourly, matches the timlön
+ *     conventions used in CBAs), the exact 52w formula for other schedules
+ *     (arbetsschema-lite). monthly_salary is the full-time salary and
+ *     hours_per_week the part-time schedule, so the raw column over the
+ *     part-time divisor would price a 10 % employee's hour ten times too high.
  */
 function effectiveHourlyRate(emp: {
   salary_type: 'monthly' | 'hourly'
   hourly_rate: number | null
   monthly_salary: number | null
+  employment_degree: number | null
   hours_per_week?: number | null
 }): number {
   if (emp.salary_type === 'hourly') return emp.hourly_rate || 0
-  const monthly = emp.monthly_salary || 0
+  const monthly = degreeAdjustedMonthlySalary(emp.monthly_salary, emp.employment_degree)
   return monthly > 0 ? Math.round((monthly / hourlyDivisor(emp.hours_per_week)) * 100) / 100 : 0
 }
 
@@ -388,6 +399,7 @@ export async function runSalaryCalculation(
   // calculation, not an error.
   const lakarintygEmployees: string[] = []
   const fkReportingEmployees: string[] = []
+  const doubleBenefitAdjustments: string[] = []
 
   // 8. Per-employee calculation loop.
   for (const sre of runEmployees) {
@@ -408,7 +420,10 @@ export async function runSalaryCalculation(
       supabase,
       companyId,
       employeeId: emp.id,
-      monthlySalary: sre.monthly_salary || 0,
+      // The pay the deductions are taken from. sre.monthly_salary is the
+      // full-time salary; a 10 % employee's karensavdrag comes off 10 % of it,
+      // the same base the engine's Step 1 pays (issue #2879).
+      monthlySalary: degreeAdjustedMonthlySalary(sre.monthly_salary, emp.employment_degree),
       payrollConfig: config,
       periodStart: deviation.start,
       periodEnd: deviation.end,
@@ -416,9 +431,7 @@ export async function runSalaryCalculation(
       dailyDivisor: dailyDivisor(emp.workdays_per_week),
       // Scheduled hours per day weight partial absence rows (4 h of an 8 h day
       // is half a day). hours_per_week already reflects the employment degree.
-      hoursPerDay:
-        (emp.hours_per_week > 0 ? emp.hours_per_week : 40) /
-        (emp.workdays_per_week > 0 ? emp.workdays_per_week : 5),
+      hoursPerDay: scheduledHoursPerDay(emp.hours_per_week, emp.workdays_per_week),
       hoursPerWeek: emp.hours_per_week > 0 ? emp.hours_per_week : 40,
       workdaysPerWeek: emp.workdays_per_week > 0 ? emp.workdays_per_week : 5,
       calculationPolicy,
@@ -694,6 +707,7 @@ export async function runSalaryCalculation(
         salary_type: emp.salary_type,
         hourly_rate: emp.hourly_rate,
         monthly_salary: sre.monthly_salary,
+        employment_degree: emp.employment_degree,
         hours_per_week: emp.hours_per_week,
       })
       const shifts: WorkedDayShift[] = workedDayRows.map((row) => ({
@@ -799,6 +813,31 @@ export async function runSalaryCalculation(
       ...derivedPremiumLineItems,
       ...derivedRecurringLineItems,
     ]
+
+    // 8e2. An employee's payment for a benefit lowers the taxable
+    //      förmånsvärde (lib/salary/benefit-payments.ts). Checked on the FINAL
+    //      set, not on the stored rows: steps 8d and 8d3 just rebuilt the
+    //      benefit and recurring rows from their registers. Refuse by name
+    //      rather than let the engine throw a 500 when the payslip cannot say
+    //      which benefit the payment is for.
+    const benefitResolution = resolveTaxableBenefits(lineItems)
+    if (!benefitResolution.ok) {
+      return {
+        ok: false,
+        code: 'VALIDATION_ERROR',
+        details: benefitPaymentRefusalDetails(`${emp.first_name} ${emp.last_name}`, benefitResolution.error),
+      }
+    }
+    // A bruttolöneavdrag of the same amount is the pre-fix workaround and now
+    // lowers the tax base twice. It can also be a real bruttolöneavdrag, so
+    // this warns on every calculation until the row is gone, never blocks.
+    doubleBenefitAdjustments.push(
+      ...describeDoubleBenefitAdjustments(
+        `${emp.first_name} ${emp.last_name}`,
+        collectDescribedLines((sre.line_items || []) as Array<Record<string, unknown>>, derivedRecurringRows),
+        benefitResolution.benefits,
+      ),
+    )
 
     // 8f. Run the engine for this employee.
     const result = calculateSalary(
@@ -1030,6 +1069,8 @@ export async function runSalaryCalculation(
         `Säkerställ att anmälan till FK är gjord.`,
     )
   }
+  const doubleAdjustmentWarning = doubleBenefitAdjustmentWarning(doubleBenefitAdjustments)
+  if (doubleAdjustmentWarning) warnings.push(doubleAdjustmentWarning)
 
   opLog.info('salary calculation complete', {
     requestId,

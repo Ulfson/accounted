@@ -12,6 +12,7 @@ import { useCapability } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import { visibleWorklistTotal } from '@/lib/worklist/visible-total'
 import type { AiTaskCategory } from '@/lib/worklist/ai-task'
+import type { MissingUnderlagSample } from '@/lib/worklist/missing-underlag'
 import type { AiClient } from '@/lib/onboarding/ai-clients'
 import { AiTaskAction } from './AiTaskAction'
 import { KopplingarChips } from './KopplingarChips'
@@ -32,6 +33,7 @@ import {
   Scale,
   ShieldCheck,
   Stamp,
+  FileQuestion,
 } from 'lucide-react'
 import type {
   ExpensePayoutDue,
@@ -88,6 +90,13 @@ interface AttGoraSectionProps {
    * client, or offer the connect buttons when there is none.
    */
   aiClients?: AiClient[]
+  /**
+   * What the biggest missing underlag actually need fetching from, derived
+   * from the same page of rows the count comes from (lib/worklist/
+   * missing-underlag). Renders as the row's detail line so the errand is
+   * visible before anyone opens a chat, and with no chat having run.
+   */
+  missingUnderlag?: MissingUnderlagSample
   /** False when no Skatteverket token is stored: the kopplingar chip offers the connect. */
   hasSkatteverketConnection?: boolean
   /**
@@ -155,6 +164,7 @@ export default function AttGoraSection({
   emptyLedger = false,
   hasActiveBankConnection = true,
   aiClients = [],
+  missingUnderlag,
   hasSkatteverketConnection = false,
   showKopplingar = false,
 }: AttGoraSectionProps) {
@@ -257,10 +267,15 @@ export default function AttGoraSection({
   const granskaRows =
     counts.supplier_invoice_approval > 0 ||
     counts.verifikat_missing_document > 0 ||
-    counts.pending_operations > 0
+    counts.pending_operations > 0 ||
+    counts.document_relevance > 0 ||
+    counts.document_unclassified > 0 ||
+    counts.document_field_review > 0 ||
+    counts.arkiv_finding > 0
   const bevakaRows =
     counts.overdue_invoice > 0 ||
     counts.deadline_action > 0 ||
+    counts.agreement_payment_missed > 0 ||
     counts.reconciliation_due > 0 ||
     expiringBankConnections.length > 0
   const allClear = !bokforRows && !betalaRows && !granskaRows && !bevakaRows
@@ -279,6 +294,17 @@ export default function AttGoraSection({
   // connected. Off the live counts, so a confirmed match updates the prompt.
   const aiAction = (category: AiTaskCategory, count: number) =>
     aiClients.length > 0 ? <AiTaskAction clients={aiClients} task={{ category, count }} /> : undefined
+
+  // Where the biggest missing underlag actually have to be fetched from, in
+  // one line, derived from the ledger rather than reported back by an agent.
+  // Silent when the answer is "look in your mail": that is what "Verifikat
+  // utan underlag" already says, and a detail line on every row is the bug
+  // convention 5 exists to prevent.
+  const topMissingUnderlag = missingUnderlag?.top
+  const missingUnderlagDetail =
+    topMissingUnderlag && topMissingUnderlag.kind !== 'mail'
+      ? t(`missing_underlag_next_${topMissingUnderlag.kind}`, { count: topMissingUnderlag.count })
+      : undefined
 
   return (
     <section aria-label={t('att_gora_title')}>
@@ -494,6 +520,7 @@ export default function AttGoraSection({
                         action={aiAction('verifikat_missing_document', counts.verifikat_missing_document)}
                         icon={FileWarning}
                         label={t('row_missing_underlag')}
+                        detail={missingUnderlagDetail}
                         count={counts.verifikat_missing_document}
                       />
                     )}
@@ -503,6 +530,41 @@ export default function AttGoraSection({
                         icon={ShieldCheck}
                         label={t('row_pending_ops')}
                         count={counts.pending_operations}
+                      />
+                    )}
+                    {counts.document_relevance > 0 && (
+                      <WorklistRow
+                        href="/arkiv/granska"
+                        icon={FileQuestion}
+                        label={t('row_document_relevance')}
+                        detail={t('row_document_relevance_detail')}
+                        count={counts.document_relevance}
+                      />
+                    )}
+                    {counts.document_unclassified > 0 && (
+                      <WorklistRow
+                        href="/arkiv/granska#typ"
+                        icon={FileQuestion}
+                        label={t('row_document_unclassified')}
+                        count={counts.document_unclassified}
+                      />
+                    )}
+                    {counts.document_field_review > 0 && (
+                      <WorklistRow
+                        href="/arkiv/granska#falt"
+                        icon={FileQuestion}
+                        label={t('row_document_field_review')}
+                        detail={t('row_document_field_review_detail')}
+                        count={counts.document_field_review}
+                      />
+                    )}
+                    {counts.arkiv_finding > 0 && (
+                      <WorklistRow
+                        href="/arkiv/granska#fynd"
+                        icon={FileQuestion}
+                        label={t('row_arkiv_finding')}
+                        detail={t('row_arkiv_finding_detail')}
+                        count={counts.arkiv_finding}
                       />
                     )}
                   </div>
@@ -529,6 +591,15 @@ export default function AttGoraSection({
                         icon={CalendarClock}
                         label={t('row_deadlines')}
                         count={counts.deadline_action}
+                      />
+                    )}
+                    {counts.agreement_payment_missed > 0 && (
+                      <WorklistRow
+                        href="/arkiv/avtal"
+                        icon={CalendarClock}
+                        label={t('row_agreement_payment_missed')}
+                        detail={t('row_agreement_payment_missed_detail')}
+                        count={counts.agreement_payment_missed}
                       />
                     )}
                     {counts.reconciliation_due > 0 && (

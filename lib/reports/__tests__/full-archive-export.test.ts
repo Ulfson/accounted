@@ -181,6 +181,21 @@ describe('generateFullArchive', () => {
   })
 
   describe('scope: period', () => {
+    it('exports supplier settlement rules and their legacy limitation for audit interpretation', async () => {
+      enqueueMany([{ data: COMPANY_ROW }, { data: PERIOD_2024 }])
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period', period_id: PERIOD_2024.id, include_documents: false,
+      })
+      const zip = await JSZip.loadAsync(buffer)
+      const documentation = JSON.parse(await zip.file('revision/systemdokumentation.json')!.async('text'))
+      const rules = documentation.leverantorsbetalningar_regler
+      expect(rules.bankmatchning).toContain('reglerade skulden i fakturans valuta')
+      expect(rules.bankmatchning).toContain('3740')
+      expect(rules.andring).toContain('PR #2850')
+      expect(rules.andring).toContain('app_releases')
+      expect(rules.historik).toContain('ändrar inte äldre betalningsrader')
+    })
+
     it('retains custom-account classification beyond the first chart page in system documentation', async () => {
       enqueueMany([{ data: COMPANY_ROW }, { data: PERIOD_2024 }])
       const chart = createQueuedMockSupabase()
@@ -245,6 +260,13 @@ describe('generateFullArchive', () => {
       expect(zip.file('dokument/manifest.json')).not.toBeNull()
       expect(zip.file('revision/behandlingshistorik.json')).not.toBeNull()
       expect(zip.file('revision/systemdokumentation.json')).not.toBeNull()
+      const documentation = JSON.parse(await zip.file('revision/systemdokumentation.json')!.async('text'))
+      expect(documentation.leverantorsfakturor_avrundning_regler.val).toContain('oavsett företagsinställning')
+      expect(documentation.leverantorsfakturor_avrundning_regler.registrering).toContain('3740 utan moms')
+      expect(documentation.leverantorsfakturor_avrundning_regler.moms).toContain('inte i beskattningsunderlaget')
+      expect(documentation.leverantorsfakturor_avrundning_regler.historik).toContain('app_releases')
+      expect(documentation.leverantorsfakturor_avrundning_regler.betalning_kontantmetoden).toContain('mindre än 1 krona')
+      expect(documentation.leverantorsfakturor_avrundning_regler.betalning_kontantmetoden).toContain('3740 utan moms')
       // Human-readable layer: CSV twins + the Swedish README.
       expect(zip.file('rapporter/saldobalans.csv')).not.toBeNull()
       expect(zip.file('rapporter/resultatrakning.csv')).not.toBeNull()

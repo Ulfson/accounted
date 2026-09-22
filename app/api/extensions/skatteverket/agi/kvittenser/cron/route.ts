@@ -7,7 +7,7 @@ import { SkatteverketAuthError } from '@/extensions/general/skatteverket/lib/api
 import { markNeedsReconsent, RECONSENT_ERROR_CODES } from '@/extensions/general/skatteverket/lib/token-store'
 import { currentSkvEnvironment, findCompanyTokenUser } from '@/extensions/general/skatteverket/lib/resolve-auth'
 import { markGrantRevoked } from '@/extensions/general/skatteverket/lib/connection-store'
-import { reconcileAgiDeclaration } from '@/extensions/general/skatteverket/lib/agi-kvittens-reconcile'
+import { reconcileAgiDeclaration, type SkvGatewayRoute } from '@/extensions/general/skatteverket/lib/agi-kvittens-reconcile'
 import { formatRedovisningsperiod } from '@/lib/skatteverket/format'
 import { hasCapability } from '@/lib/entitlements/has-capability'
 import { CAPABILITY } from '@/lib/entitlements/keys'
@@ -104,10 +104,20 @@ export async function GET(request: Request) {
   type Result = {
     declarationId: string
     period: string
-    status: 'signed' | 'still_pending' | 'already_claimed' | 'no_token' | 'no_company_settings' | 'expired_token' | 'grant_revoked' | 'error'
+    status: 'signed' | 'still_pending' | 'already_claimed' | 'no_token' | 'no_company_settings' | 'expired_token' | 'grant_revoked' | 'gateway_refused' | 'error'
     error?: string
   }
   const results: Result[] = []
+  // Filled when Skatteverket's gateway refuses the APIGW client itself. That
+  // verdict is reached before any bearer is read, so it is the same for every
+  // remaining declaration behind the same client: the run stops asking
+  // instead of collecting one identical refusal (and one identical log line)
+  // per declaration. Keyed by route because a company on the connector canary
+  // reaches Skatteverket through the broker's client, not this installation's:
+  // a refusal of one must never starve the companies behind the other. The
+  // reconciler owns the route (it knows which credential it resolved) and
+  // answers gateway_refused without calling for a route already in the set.
+  const refusedRoutes = new Set<SkvGatewayRoute>()
 
   for (const decl of pending) {
     if (Date.now() - startTime > TIME_BUDGET_MS) {
@@ -138,12 +148,29 @@ export async function GET(request: Request) {
           period_year: decl.period_year as number,
           period_month: decl.period_month as number,
         },
-        { reconciledBy: 'cron' },
+        { reconciledBy: 'cron', refusedRoutes },
       )
 
       const result: Result = { declarationId, period, status: outcome.status }
       if ('error' in outcome) result.error = outcome.error
       results.push(result)
+
+      if (outcome.status === 'gateway_refused' && outcome.asked) {
+        refusedRoutes.add(outcome.route)
+        // warn, once per run, not error per declaration: this is a standing
+        // operator-side state (the APIGW client has no subscription to the AGI
+        // hantera API in Utvecklarportalen, #973 / #2226), not something a
+        // retry, a reconnect or a code change can clear. Raising it as a fresh
+        // error per declaration per tick buried the error stream (110 in two
+        // days) without telling anyone anything new. The declarations stay
+        // pending_signature and heal on the first run after the subscription
+        // exists; the AGI panel tells the user the truth meanwhile.
+        log.warn('Skatteverket gateway refuses the APIGW client for AGI kvittens reads; no further calls this run', {
+          issue: '#2226',
+          route: outcome.route,
+          pending: pending.length,
+        })
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error'
 
@@ -177,22 +204,21 @@ export async function GET(request: Request) {
         results.push({ declarationId, period, status: 'expired_token', error: err.code })
         continue
       }
-      // ACCESS_DENIED (Skatteverket's gateway refusing the APIGW client) is
-      // no longer bucketed as a known configuration gap: the AGI hantera
-      // subscription is expected to be in place (#2226), so a gateway refusal
-      // is a real regression and lands in the error path below like any
-      // other failure.
+      // The gateway refusing the APIGW client itself never reaches this catch:
+      // the reconciler returns it as the gateway_refused outcome above. Every
+      // other ACCESS_DENIED (kill switch, scope contract, generic 403) is a
+      // real failure and lands in the error path like any other.
       log.error('Reconciliation failed', { declarationId, companyId, period, message })
-      // A gateway refusal keeps its machine-readable code in the body (as the
+      // An access denial keeps its machine-readable code in the body (as the
       // expired_token / grant_revoked rows do): the keyword heuristic in
       // getErrorMessage misses the gateway wording and would collapse it
       // into "Något gick fel". The full guidance is in the error log above.
-      const isGatewayRefusal = err instanceof SkatteverketAuthError && err.code === 'ACCESS_DENIED'
+      const isAccessDenied = err instanceof SkatteverketAuthError && err.code === 'ACCESS_DENIED'
       results.push({
         declarationId,
         period,
         status: 'error',
-        error: isGatewayRefusal ? err.code : getErrorMessage(err),
+        error: isAccessDenied ? err.code : getErrorMessage(err),
       })
     }
   }
@@ -203,9 +229,10 @@ export async function GET(request: Request) {
   const expired = results.filter(r => r.status === 'expired_token').length
   const grantRevoked = results.filter(r => r.status === 'grant_revoked').length
   const errors = results.filter(r => r.status === 'error').length
+  const gatewayRefused = refusedRoutes.size > 0
 
   console.log(
-    `[agi-kvittenser-cron] Processed ${results.length}: ${signed} signed, ${stillPending} still pending, ${alreadyClaimed} already claimed, ${expired} expired, ${grantRevoked} grants revoked, ${errors} errors`,
+    `[agi-kvittenser-cron] Processed ${results.length}: ${signed} signed, ${stillPending} still pending, ${alreadyClaimed} already claimed, ${expired} expired, ${grantRevoked} grants revoked, ${errors} errors${gatewayRefused ? ', stopped: gateway refused the APIGW client' : ''}`,
   )
 
   return NextResponse.json(
@@ -217,6 +244,7 @@ export async function GET(request: Request) {
       expired,
       grantRevoked,
       errors,
+      gatewayRefused,
       results,
     },
     { headers: NO_STORE_HEADERS },

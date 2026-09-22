@@ -4,8 +4,11 @@ import { formatRedovisare, formatRedovisningsperiod } from '@/lib/skatteverket/f
 import { parseEntityType } from '@/lib/company/entity-type'
 import { completeTaxDeadline } from '@/lib/deadlines/complete-tax-deadline'
 import { agiGetKvittenser } from './agi-client'
+import { isApigwClientRefusal } from './api-client'
+import { skatteverketConnectorMode } from './connector-mode'
 import { resolveReadAuth } from './resolve-auth'
 import { sendKvittensNotification } from './kvittens-notification'
+import type { SkatteverketAGIKvittens } from '../types'
 
 /**
  * Shared per-declaration kvittens reconciliation.
@@ -20,6 +23,17 @@ import { sendKvittensNotification } from './kvittens-notification'
  * Auth errors (SkatteverketAuthError) propagate to the caller on purpose: the
  * cron maps them to per-run statuses and side effects (needs_reconsent
  * flagging, grant revocation) that differ from the post-connect path.
+ *
+ * One refusal is NOT about the connection and therefore comes back as an
+ * outcome instead: `gateway_refused`, Skatteverket's gateway rejecting the
+ * APIGW client itself (#973, #2226). It is decided before any bearer is read,
+ * so it is identical for every company and every credential: callers stop
+ * asking for the rest of their run instead of collecting the same answer once
+ * per declaration.
+ *
+ * The promotion itself (claim + side effects) is `promoteAgiDeclaration`,
+ * shared with the interactive "Hämta kvittens" check so that whichever path
+ * observes the kvittens first runs the side effects, exactly once.
  *
  * Logging goes through the structured logger (redaction + level filtering);
  * the cron tests observe it via a logger mock.
@@ -43,15 +57,49 @@ export type AgiReconcileOutcome =
   | { status: 'no_token' }
   | { status: 'expired_token'; error: string }
   | { status: 'no_company_settings' }
+  /**
+   * Skatteverket's gateway refused the APIGW client, see above. `route` is the
+   * client that was (or would have been) refused; `asked` is false when the
+   * caller already knew and the call was not made.
+   */
+  | { status: 'gateway_refused'; route: SkvGatewayRoute; asked: boolean }
   | { status: 'error'; error: string }
+
+/**
+ * Which APIGW client a read goes out with: this installation's own, or the
+ * connector broker's (connector mode, or a company on the connector canary).
+ * A refusal says something about one client only, so callers key what they
+ * know by this. Same rule as skvRequestWithAuth: system credentials are never
+ * brokered, so only a user-token read can take the connector route.
+ */
+export type SkvGatewayRoute = 'direct' | 'connector'
+
+export type AgiPromotionOutcome = Extract<
+  AgiReconcileOutcome,
+  { status: 'signed' | 'already_claimed' | 'error' }
+>
+
+/**
+ * A kvittens signed longer ago than this is recorded silently. The email
+ * exists because signing happens at Skatteverket after the user has left our
+ * tab, so it is the only confirmation they get; weeks later it is not a
+ * confirmation any more, it is an unexplained "har signerats" about a filing
+ * they finished long ago (the declarations stranded since June by #2226 would
+ * each produce one on the first reconnect after the gateway opens up).
+ */
+const KVITTENS_NOTIFICATION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
 export async function reconcileAgiDeclaration(
   supabase: SupabaseClient,
   decl: PendingAgiDeclaration,
-  opts: { reconciledBy: 'cron' | 'post-connect'; userId?: string },
+  opts: {
+    reconciledBy: 'cron' | 'post-connect'
+    userId?: string
+    /** Routes the caller has already seen refused in this run: not asked again. */
+    refusedRoutes?: ReadonlySet<SkvGatewayRoute>
+  },
 ): Promise<AgiReconcileOutcome> {
   const companyId = decl.company_id
-  const declarationId = decl.id
   const period = formatRedovisningsperiod('monthly', decl.period_year, decl.period_month)
 
   // Auth resolution prefers system credentials (verified lasombud grant)
@@ -88,7 +136,21 @@ export async function reconcileAgiDeclaration(
     parseEntityType(settings.entity_type),
   )
 
-  const kvittRes = await agiGetKvittenser(resolved.auth, arbetsgivare, period)
+  // Decided here, from the credential that was actually resolved, so the
+  // caller's breaker can never disagree with the request about the route.
+  const route: SkvGatewayRoute =
+    resolved.auth.mode === 'user' && skatteverketConnectorMode(companyId) ? 'connector' : 'direct'
+  if (opts.refusedRoutes?.has(route)) {
+    return { status: 'gateway_refused', route, asked: false }
+  }
+
+  let kvittRes: Awaited<ReturnType<typeof agiGetKvittenser>>
+  try {
+    kvittRes = await agiGetKvittenser(resolved.auth, arbetsgivare, period)
+  } catch (err) {
+    if (isApigwClientRefusal(err)) return { status: 'gateway_refused', route, asked: true }
+    throw err
+  }
   if (!kvittRes.ok) {
     return { status: 'error', error: kvittRes.error }
   }
@@ -96,6 +158,47 @@ export async function reconcileAgiDeclaration(
   const kvittens = kvittRes.data.kvittenser?.[0]
   if (!kvittens?.uuidKvittens) {
     return { status: 'still_pending' }
+  }
+
+  return promoteAgiDeclaration(supabase, decl, kvittens, {
+    reconciledBy: opts.reconciledBy,
+    submittedBy: resolved.tokenUserId,
+    notifyUserId: resolved.tokenUserId,
+  })
+}
+
+/**
+ * Promote a `pending_signature` declaration to `submitted` from an observed
+ * kvittens, and run the filing side effects (salary run stamp, cache cleanup,
+ * deadline confirmation, notification) exactly once.
+ *
+ * `notifyUserId` null skips the email: the interactive check runs while the
+ * user is looking at the panel, which shows the receipt itself.
+ */
+export async function promoteAgiDeclaration(
+  supabase: SupabaseClient,
+  decl: PendingAgiDeclaration,
+  kvittens: SkatteverketAGIKvittens,
+  opts: {
+    reconciledBy: 'cron' | 'post-connect' | 'interactive'
+    submittedBy: string | null
+    notifyUserId: string | null
+    /**
+     * Statuses the claim may promote from. Background runs only ever revisit
+     * `pending_signature`. The interactive check also accepts a declaration
+     * that never went through our signing link (XML filed by hand at
+     * Skatteverket), as it always has; a row that already carries a receipt
+     * (`submitted` / `accepted`) is never claimed again.
+     */
+    fromStatuses?: readonly string[]
+  },
+): Promise<AgiPromotionOutcome> {
+  const companyId = decl.company_id
+  const declarationId = decl.id
+  const period = formatRedovisningsperiod('monthly', decl.period_year, decl.period_month)
+  const kvittensnummer = kvittens.uuidKvittens
+  if (!kvittensnummer) {
+    return { status: 'error', error: 'Kvittensen saknar kvittensnummer.' }
   }
 
   // The presence of uuidKvittens confirms SKV signed and accepted
@@ -125,8 +228,8 @@ export async function reconcileAgiDeclaration(
   // reference for the audit trail (BFL 5 kap 6§, BFNAR 2013:2 kap 8);
   // we preserve the full kvittens in response_data so it records the
   // actual BankID signer regardless of who triggered the reconciliation.
-  // Compare-and-set claim: the 2-hourly cron and a post-connect refresh can
-  // race on the same declaration, and the side effects below (salary_runs
+  // Compare-and-set claim: the cron, a post-connect refresh and the panel's
+  // interactive check can race on the same declaration, and the side effects below (salary_runs
   // stamp, cache cleanup, deadline confirmation, notification) must run
   // exactly once. Zero updated rows means another run won the claim; a
   // failed update must not fall through to those side effects either.
@@ -134,14 +237,14 @@ export async function reconcileAgiDeclaration(
     .from('agi_declarations')
     .update({
       status: 'submitted',
-      kvittensnummer: kvittens.uuidKvittens,
+      kvittensnummer,
       submitted_at: submittedAt,
-      submitted_by: resolved.tokenUserId,
+      submitted_by: opts.submittedBy,
       response_data: {
         signeradAv: kvittens.signeradAv ?? null,
         signeradTid: kvittens.signeradTid ?? null,
         submittedAtEstimated: !kvittens.signeradTid,
-        uuidKvittens: kvittens.uuidKvittens,
+        uuidKvittens: kvittensnummer,
         arbetsgivare: kvittens.arbetsgivare ?? null,
         period: kvittens.period ?? null,
         underlag: kvittens.underlag ?? null,
@@ -150,7 +253,7 @@ export async function reconcileAgiDeclaration(
     })
     .eq('id', declarationId)
     .eq('company_id', companyId)
-    .eq('status', 'pending_signature')
+    .in('status', [...(opts.fromStatuses ?? ['pending_signature'])])
     .select('id')
 
   if (claimError) {
@@ -214,15 +317,25 @@ export async function reconcileAgiDeclaration(
   }
 
   // Tell the user: signing happened at Skatteverket, often long after
-  // they closed our tab, so this is the only confirmation they get.
-  if (resolved.tokenUserId) {
+  // they closed our tab, so this is the only confirmation they get. A kvittens
+  // observed long after the signing is recorded without the email (see
+  // KVITTENS_NOTIFICATION_MAX_AGE_MS); an unknown signing time still notifies.
+  const signedAtMs = kvittens.signeradTid ? Date.parse(kvittens.signeradTid) : NaN
+  const staleKvittens =
+    !Number.isNaN(signedAtMs) && Date.now() - signedAtMs > KVITTENS_NOTIFICATION_MAX_AGE_MS
+  if (staleKvittens) {
+    log.info('kvittens observed long after signing; recorded without notification', {
+      declarationId, companyId, period,
+    })
+  }
+  if (opts.notifyUserId && !staleKvittens) {
     try {
       await sendKvittensNotification(supabase, {
         companyId,
-        userId: resolved.tokenUserId,
+        userId: opts.notifyUserId,
         kind: 'agi',
         period,
-        kvittensnummer: kvittens.uuidKvittens,
+        kvittensnummer,
         referenceId: declarationId,
       })
     } catch (notifyErr) {
@@ -233,5 +346,5 @@ export async function reconcileAgiDeclaration(
     }
   }
 
-  return { status: 'signed', kvittensnummer: kvittens.uuidKvittens }
+  return { status: 'signed', kvittensnummer }
 }
