@@ -14,7 +14,9 @@ const row = { counterparty: 'Example AB', invoice_number: '001', invoice_date: '
   currency: 'SEK', vat_treatment: 'standard_25', total: 1250, vat_amount: 250, remaining_amount: 625,
   voucher_series: 'B', voucher_number: 17, voucher_year: 2026, payment_reference: '' }
 const input = { company_id: '00000000-0000-4000-8000-000000000001', kind: 'customer', snapshot_date: '2026-09-21', rows: [row] }
+/** Build a JSON request using the valid synthetic import by default. */
 const request = (body: unknown = input) => createMockRequest('/api/import/subledger', { method: 'POST', body })
+/** Exercise the wrapped route with the current authentication mocks. */
 const call = (body: unknown = input) => POST(request(body), createMockRouteParams({}))
 
 describe('hosted subledger import route', () => {

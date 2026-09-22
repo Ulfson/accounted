@@ -108,6 +108,10 @@ company isolation, duplicate rejection, unchanged journal snapshots, partial
 balances, stale snapshots and concurrent receipt recovery.
 
 The new migration must be validated in Accounted's permitted staging environment
-before merge/deployment. Local Postgres and the user's self-hosted installation
+before merge/deployment. Apply the follow-up
+`20260922115437_harden_file_subledger_search_path.sql` as well: it keeps temporary
+tables behind public relations in the privileged RPC. The PostgreSQL tests cover
+forged temporary membership during preview and execution, plus legitimate owner
+access with a temporary shadow present. Local Postgres and the user's self-hosted installation
 are not test targets. Deploy the migration and application together through the
 project's normal release process; publishing this PR alone does not activate it.

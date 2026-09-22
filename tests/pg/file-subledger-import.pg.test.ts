@@ -5,10 +5,12 @@ import { getPool, withUserContext, getClient } from './setup'
 import { seedCompany, insertAuthUser, insertCompanyMember, insertPostedJournalEntry, insertFiscalPeriod } from './fixtures'
 
 type Kind = 'customer' | 'supplier'
+/** Build a synthetic open invoice with preserved source identifiers. */
 const sourceRow = (party: string) => ({ counterparty: party, invoice_number: '000123', invoice_date: '2026-06-01',
   due_date: '2026-06-30', currency: 'SEK', vat_treatment: 'standard_25', total: 1250, vat_amount: 250,
   remaining_amount: 1250, voucher_series: 'A', voucher_number: 17, voucher_year: 2026, payment_reference: '0012345' })
 
+/** Seed an accrual company and an existing registration voucher for either ledger. */
 async function fixture(kind: Kind = 'customer') {
   const f = await seedCompany()
   await getPool().query('INSERT INTO company_settings(company_id,user_id,accounting_method) VALUES($1,$2,$3)', [f.companyId, f.userId, 'accrual'])
@@ -19,10 +21,12 @@ async function fixture(kind: Kind = 'customer') {
     : [{ accountNumber: '2440', debitAmount: 0, creditAmount: 1250 }, { accountNumber: '4000', debitAmount: 1000, creditAmount: 0 }, { accountNumber: '2641', debitAmount: 250, creditAmount: 0 }] })
   return { ...f, party, voucher, row: sourceRow(party), kind }
 }
+/** Invoke the real import RPC with the fixture snapshot and reviewed rows. */
 async function run(client: PoolClient, f: Awaited<ReturnType<typeof fixture>>, execute = false, token: string | null = null, rows = [f.row]) {
   return (await client.query('SELECT import_file_subledger($1,$2,$3,$4::jsonb,$5,$6) AS result',
     [f.companyId, f.kind, '2026-06-30', JSON.stringify(rows), execute, token])).rows[0].result
 }
+/** Capture complete journal contents to detect unintended bookkeeping writes. */
 async function journalSnapshot(client: PoolClient, companyId: string) {
   return (await client.query(`SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) AS entries,
     (SELECT jsonb_agg(to_jsonb(l) ORDER BY l.id) FROM journal_entry_lines l JOIN journal_entries j ON j.id=l.journal_entry_id WHERE j.company_id=$1) AS lines
@@ -44,6 +48,38 @@ async function committedUser<T>(userId: string, fn: (client: PoolClient) => Prom
 }
 
 describe('file subledger RPC', () => {
+  it('pins temporary relations after public without losing definer settings', async () => {
+    const result = await getPool().query(`SELECT prosecdef, proconfig FROM pg_proc
+      WHERE oid='public.import_file_subledger(uuid,text,date,jsonb,boolean,text)'::regprocedure`)
+    expect(result.rows[0].prosecdef).toBe(true)
+    expect(result.rows[0].proconfig).toEqual(expect.arrayContaining([
+      'search_path=public, pg_temp', 'statement_timeout=15s', 'lock_timeout=2s',
+    ]))
+  })
+  it.each([false, true])('rejects forged temporary membership with execute=%s', async execute => {
+    const f = await fixture()
+    const stranger = await insertAuthUser()
+    const preview = await withUserContext(f.userId, client => run(client, f))
+    await expect(withUserContext(stranger, async client => {
+      await client.query(`CREATE TEMP TABLE company_members (
+        company_id uuid, user_id uuid, role text
+      ) ON COMMIT DROP`)
+      await client.query("INSERT INTO pg_temp.company_members VALUES ($1,$2,'owner')", [f.companyId, stranger])
+      return run(client, f, execute, preview.token)
+    })).rejects.toThrow('SUBLEDGER_FORBIDDEN')
+    expect((await getPool().query('SELECT count(*)::int AS n FROM invoices WHERE company_id=$1', [f.companyId])).rows[0].n).toBe(0)
+    expect((await getPool().query('SELECT count(*)::int AS n FROM subledger_file_imports WHERE company_id=$1', [f.companyId])).rows[0].n).toBe(0)
+  })
+  it('uses real membership for an owner despite an empty temporary shadow', async () => {
+    const f = await fixture()
+    await withUserContext(f.userId, async client => {
+      await client.query(`CREATE TEMP TABLE company_members (
+        company_id uuid, user_id uuid, role text
+      ) ON COMMIT DROP`)
+      expect((await run(client, f)).difference).toBe(0)
+    })
+  })
+
   it.each<Kind>(['customer', 'supplier'])('imports %s balances and preserves every journal byte', async kind => {
     const f = await fixture(kind)
     await withUserContext(f.userId, async client => {

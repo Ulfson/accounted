@@ -5,6 +5,7 @@ import { SUBLEDGER_COLUMNS, SubledgerImportSchema } from '../schema'
 
 const values = ['001', '000123', '2026-08-31', '2026-09-20', 'SEK', '1250', '250', '625', 'B', '17', '2026', '00012345']
 values.splice(5, 0, 'standard_25')
+/** Encode a template row as CSV bytes for parser boundary tests. */
 function csv(row = values) {
   return new TextEncoder().encode(SUBLEDGER_COLUMNS.join(';') + '\n' + row.join(';')).buffer
 }

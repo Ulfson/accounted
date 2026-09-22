@@ -17,6 +17,7 @@ import { SUBLEDGER_COLUMNS, type SubledgerRow, type SubledgerResult } from '@/li
 type Preview = SubledgerResult & { source_rows: SubledgerRow[] }
 
 /** Import existing balances only, after a server-generated review. */
+/** Review and confirm an import against the active company and posted balances. */
 export default function SubledgerImport() {
   const t = useTranslations('subledgerImport')
   const locale = useLocale() === 'en' ? 'en' : 'sv'
@@ -33,12 +34,15 @@ export default function SubledgerImport() {
   // compare IDs before every request so a retained preview can never be used.
   const currentPreview = preview?.company_id === company?.id ? preview : null
 
+  /** Discard approval state whenever the import inputs change. */
   function reset() { setPreview(null); setCompleted(false); setError(''); setConfirm(false) }
+  /** Download the canonical column headers without customer data. */
   function template() {
     const url = URL.createObjectURL(new Blob(['\uFEFF' + SUBLEDGER_COLUMNS.join(';') + '\r\n'], { type: 'text/csv;charset=utf-8' }))
     const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'accounted-subledger.csv'
     anchor.click(); URL.revokeObjectURL(url)
   }
+  /** Preview the uploaded file or execute the previously reviewed rows and token. */
   async function submit(execute: boolean) {
     if (!company || !file || (execute && !currentPreview)) return
     setBusy(true); setError(''); setConfirm(false)
