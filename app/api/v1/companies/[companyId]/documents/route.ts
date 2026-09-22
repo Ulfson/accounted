@@ -72,7 +72,7 @@ registerEndpoint({
   method: 'POST',
   path: '/api/v1/companies/:companyId/documents',
   summary: 'Upload a document to the WORM archive.',
-  description: `Multipart upload of a document (PDF / image) under the BFL 7 kap retention regime. The bytes are hashed (SHA-256), written to Supabase Storage, and recorded in document_attachments at version=1. Allowed MIME types: ${ALLOWED_DOCUMENT_TYPES.join(', ')}. Max size: ${MAX_DOCUMENT_SIZE / 1024 / 1024} MB.`,
+  description: `Multipart upload of a document (PDF, image or Office file) under the BFL 7 kap retention regime. The bytes are hashed (SHA-256), written to Supabase Storage, and recorded in document_attachments at version=1. Allowed MIME types: ${ALLOWED_DOCUMENT_TYPES.join(', ')}. Max size: ${MAX_DOCUMENT_SIZE / 1024 / 1024} MB.`,
   useWhen:
     'You have a receipt, invoice scan, or supporting document for a posted verifikation and want it archived for the 7-year BFL retention period. Optionally link to a journal entry at upload time via journal_entry_id.',
   doNotUseFor:
@@ -267,6 +267,10 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
           upload_source: uploadSource,
           journal_entry_id: journalEntryId,
           journal_entry_line_id: journalEntryLineId,
+          // No v1 read exposes extraction fields, so nothing a client can
+          // observe depends on the subscribers having finished. Awaiting
+          // them held the 201 for the length of a model call.
+          deferUploadedEvent: true,
         },
       )
       // `storage_path` is deliberately omitted from the public response:

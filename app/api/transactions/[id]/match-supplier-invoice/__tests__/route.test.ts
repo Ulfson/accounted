@@ -68,6 +68,8 @@ vi.mock('@/lib/bookkeeping/engine', () => ({
 
 import { POST } from '../route'
 import { eventBus } from '@/lib/events/bus'
+import { syncInvoiceStatusFromPaymentEntry } from '@/lib/bookkeeping/payment-sync'
+import { fetchPaymentsAsOf, outstandingAsOf } from '@/lib/reports/reskontra-payments'
 
 const mockUser = { id: 'user-1', email: 'test@test.se' }
 
@@ -160,6 +162,130 @@ function enqueueHappyPath(opts: {
 }
 
 describe('POST /api/transactions/[id]/match-supplier-invoice: FX residual', () => {
+  it('requires authentication before matching', async () => {
+    mockSupabase.auth.getUser.mockResolvedValue({ data: { user: null } })
+    expect((await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))).status).toBe(401)
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('rejects an invalid invoice id', async () => {
+    const request = new Request(`http://localhost/api/transactions/${TX_UUID}/match-supplier-invoice`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ supplier_invoice_id: 'invalid' }),
+    })
+    expect((await POST(request, createMockRouteParams({ id: TX_UUID }))).status).toBe(400)
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('returns 404 when the transaction does not exist', async () => {
+    enqueue({ data: null, error: null })
+    expect((await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))).status).toBe(404)
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [11231.25, 11231, 0],
+    [11231.75, 11232, 0],
+    [11231.25, 11231, 500],
+    [11231.75, 11232, 500],
+    [11231, 11231, 500],
+    [11231.25, 10000, 500],
+  ])('records the settled debt for reports and reversal (remaining %s, bank %s, earlier payments %s)', async (remaining, cash, earlierPaid) => {
+    enqueueHappyPath({
+      transaction: { amount: -cash, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: remaining, paid_amount: earlierPaid },
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    const { status, body } = await parseJsonResponse<{ paid_amount: number; remaining_amount: number }>(res)
+    expect(status).toBe(200)
+    const payment = findCalls('supplier_invoice_payments', 'insert').at(-1)![0] as {
+      amount: number; payment_date: string; supplier_invoice_id: string
+    }
+    const input = mockCreateJournalEntry.mock.calls[0][3] as {
+      lines: Array<{ account_number: string; debit_amount: number; credit_amount: number }>
+    }
+    const applied = input.lines.find(l => l.account_number === '2440')!.debit_amount
+    expect(input.lines.find(l => l.account_number === '1930')!.credit_amount).toBe(cash)
+    const rounding = input.lines.find(l => l.account_number === '3740')
+    if (applied !== cash) {
+      expect(rounding).toMatchObject({
+        debit_amount: Math.max(0, cash - applied),
+        credit_amount: Math.max(0, applied - cash),
+      })
+    } else {
+      expect(rounding).toBeUndefined()
+    }
+
+    // A pre-fix partial payment stored cash, which equals its settled debt.
+    // Reconstruct both sides of the new final payment from the real dated rows.
+    for (const [date, expected] of [
+      ['2026-05-11', remaining], ['2026-05-12', body.remaining_amount],
+    ] as const) {
+      const history = createQueuedMockSupabase()
+      history.enqueue({ data: [
+        { supplier_invoice_id: SI_UUID, amount: earlierPaid, payment_date: '2026-05-01' },
+        payment,
+      ] })
+      const payments = await fetchPaymentsAsOf(
+        history.supabase as never, 'supplier_invoice_payments', 'supplier_invoice_id', 'company-1', date,
+      )
+      expect(outstandingAsOf(
+        { id: SI_UUID }, remaining + earlierPaid, body.remaining_amount, payments, date,
+      )).toBe(expected)
+    }
+    expect(payment.amount).toBe(applied)
+
+    // Feed the actual saved row into the real reversal helper. Earlier payments
+    // must survive, including when this payment rounded UP rather than down.
+    const reversal = createQueuedMockSupabase()
+    reversal.enqueueMany([
+      { data: { total: remaining + earlierPaid, paid_amount: body.paid_amount, due_date: '2099-01-01' } },
+      { data: null },
+      { data: null },
+      { data: [] },
+    ])
+    await syncInvoiceStatusFromPaymentEntry(reversal.supabase as never, 'company-1', {
+      id: 'je-1', source_id: SI_UUID, source_type: 'supplier_invoice_paid',
+    }, {
+      paymentRows: [{ id: 'payment-1', amount: payment.amount, transaction_id: TX_UUID }],
+      transactionIds: [TX_UUID],
+    })
+    expect(reversal.findCalls('supplier_invoices', 'update').at(-1)![0]).toMatchObject({
+      paid_amount: earlierPaid, remaining_amount: remaining,
+      status: earlierPaid > 0 ? 'partially_paid' : 'approved',
+    })
+  })
+
+  it.each([[11231.25, 11231], [11231.75, 11232]])(
+    'can reverse an older partial payment after a new rounded settlement (%s debt, %s cash)',
+    async (remaining, cash) => {
+      const earlierPaid = 500.25
+      enqueueHappyPath({
+        transaction: { amount: -cash, currency: 'SEK' },
+        invoice: { currency: 'SEK', remaining_amount: remaining, paid_amount: earlierPaid },
+      })
+      const response = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+      const { status, body } = await parseJsonResponse<{ paid_amount: number }>(response)
+      expect(status).toBe(200)
+      const payment = findCalls('supplier_invoice_payments', 'insert').at(-1)![0] as { amount: number }
+      const reversal = createQueuedMockSupabase()
+      reversal.enqueueMany([
+        { data: { total: remaining + earlierPaid, paid_amount: body.paid_amount, due_date: '2099-01-01' } },
+        { data: null }, { data: null }, { data: [] },
+      ])
+      await syncInvoiceStatusFromPaymentEntry(reversal.supabase as never, 'company-1', {
+        id: 'legacy-je', source_id: SI_UUID, source_type: 'supplier_invoice_paid',
+      }, {
+        paymentRows: [{ id: 'legacy-partial', amount: earlierPaid, transaction_id: 'legacy-tx' }],
+        transactionIds: ['legacy-tx'],
+      })
+      expect(reversal.findCalls('supplier_invoices', 'update').at(-1)![0]).toMatchObject({
+        paid_amount: payment.amount, remaining_amount: earlierPaid, status: 'partially_paid',
+      })
+      expect(reversal.findCalls('supplier_invoice_payments', 'in')).toContainEqual(['id', ['legacy-partial']])
+    },
+  )
+
   it('books a clean SEK clearing entry (no FX) for a SEK tx paying a SEK invoice', async () => {
     // SEK/SEK now routes through buildSupplierPaymentClearingLines +
     // createJournalEntry, not createSupplierInvoicePaymentEntry. An exact
@@ -432,8 +558,10 @@ describe('POST /api/transactions/[id]/match-supplier-invoice: settlement account
     expect(mockCreatePaymentEntry).not.toHaveBeenCalled()
     const args = mockCreateCashEntry.mock.calls[0]
     expect(args[8]).toBe('1940')
-    // Pure SEK settlement: no settledBankSek override.
-    expect(args[9]).toBeUndefined()
+    // Pure SEK settlement: the bank amount is handed over so a sub-krona
+    // difference to the invoice total can land on 3740 (#2852). An exact
+    // amount, as here, books exactly as before.
+    expect(args[9]).toBe(500)
   })
 
   it('cash-method branch: falls back to 1930 when the transaction has no linked cash account', async () => {
@@ -690,14 +818,46 @@ describe('POST /api/transactions/[id]/match-supplier-invoice: cash method + FX',
     expect(mockCreateCashEntry).not.toHaveBeenCalled()
   })
 
-  it('does NOT absorb öre under the cash method: a SEK sub-krona diff is rejected as partial', async () => {
-    // Kontantmetoden books the full invoice via the cash entry (not the bank
-    // amount), so folding the 0,25 to 3740 would hide a 1930 discrepancy. The
-    // öre band is accrual-only. Previously the sub-krona shortfall booked the
-    // FULL cash entry while leaving the invoice partially_paid (an over-book
-    // the invoice could never recover from); now it is rejected outright.
+  // #2852: the öre band used to be accrual-only, because the cash builder
+  // credited the payment account with the exact öre total: absorbing would
+  // have marked the invoice paid while 1930 silently drifted from the bank row.
+  // The builder now credits the bank amount and books the residual on 3740,
+  // so a whole-krona payment settles a kontantmetoden invoice in full too.
+  it('absorbs öre under the cash method: a rounded-DOWN whole-krona row settles in full and hands the builder the bank amount', async () => {
     enqueueHappyPath({
       transaction: { amount: -11231, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: 11231.25 },
+      accountingMethod: 'cash',
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    const { status, body } = await parseJsonResponse<{
+      invoice_status: string
+      remaining_amount: number
+      paid_amount: number
+    }>(res)
+    expect(status).toBe(200)
+    expect(mockCreateCashEntry).toHaveBeenCalledTimes(1)
+    expect(mockCreateCashEntry.mock.calls[0][9]).toBe(11231)
+    expect(body.invoice_status).toBe('paid')
+    expect(body.remaining_amount).toBe(0)
+    // The debt settled, not the cash moved: the 0,25 lives on 3740.
+    expect(body.paid_amount).toBe(11231.25)
+  })
+
+  it('absorbs öre under the cash method: a rounded-UP whole-krona row is not an overshoot', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -1235, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: 1234.56 },
+      accountingMethod: 'cash',
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    expect(res.status).toBe(200)
+    expect(mockCreateCashEntry.mock.calls[0][9]).toBe(1235)
+  })
+
+  it('a shortfall of a krona or more under the cash method is still a partial, and still rejected', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -11230, currency: 'SEK' },
       invoice: { currency: 'SEK', remaining_amount: 11231.25 },
       accountingMethod: 'cash',
     })
@@ -707,6 +867,35 @@ describe('POST /api/transactions/[id]/match-supplier-invoice: cash method + FX',
     expect(body.error.code).toBe('SI_CASH_PARTIAL_UNSUPPORTED')
     expect(mockCreateCashEntry).not.toHaveBeenCalled()
     expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('an overshoot of a krona or more under the cash method is still rejected', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -1236, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: 1234.56 },
+      accountingMethod: 'cash',
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(res)
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('MATCH_SI_AMOUNT_EXCEEDS_REMAINING')
+    expect(mockCreateCashEntry).not.toHaveBeenCalled()
+  })
+
+  it('a previously part-paid kontantmetoden invoice stays blocked even when the row is within the öre band', async () => {
+    // The rounding residual belongs to the one settling payment of a fully
+    // unpaid invoice; the cash builder books the whole invoice and cannot
+    // complete a partial.
+    enqueueHappyPath({
+      transaction: { amount: -500, currency: 'SEK' },
+      invoice: { currency: 'SEK', paid_amount: 500, remaining_amount: 500.4 },
+      accountingMethod: 'cash',
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(res)
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('SI_CASH_PARTIAL_UNSUPPORTED')
+    expect(mockCreateCashEntry).not.toHaveBeenCalled()
   })
 })
 

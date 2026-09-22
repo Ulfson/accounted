@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { generateAgiDeclaration } from '../agi/generate-declaration'
 import { createQueuedMockSupabase } from '@/tests/helpers'
 import { eventBus } from '@/lib/events'
+import { roundOre } from '@/lib/money'
 import type { Logger } from '@/lib/logger'
 
 vi.mock('../personnummer', () => ({
@@ -531,5 +532,108 @@ describe('generateAgiDeclaration: utlägg repaid with the salary (#2331)', () =>
     }
     // The employer's FK487 underlag is the same as without the line.
     expect(result.xml).toContain('faltkod="487">12568<')
+  })
+})
+
+describe('generateAgiDeclaration: an employee payment for a benefit reduces the declared förmånsvärde', () => {
+  // swedish-payroll skill, deductions-lonevaxling.md: a nettolöneavdrag "DOES
+  // reduce the taxable förmånsvärde if the deduction constitutes payment for a
+  // specific benefit". The AGI must carry the same reduced value the engine
+  // taxed, or FK013 disagrees with the payslip's own underlag.
+  const CAR = { item_type: 'benefit_car', amount: 6664 }
+  const payment = (amount: number) => ({ item_type: 'net_deduction_benefit_payment', amount, is_net_deduction: true })
+  // A row as the fixed engine stores it: benefit_values is the REDUCED value.
+  const row = (lineItems: unknown[], benefitValues: number) => ({
+    ...REGULAR_ROW,
+    monthly_salary: 48000,
+    gross_salary: 48000,
+    benefit_values: benefitValues,
+    avgifter_basis: 48000 + benefitValues,
+    avgifter_amount: roundOre((48000 + benefitValues) * 0.3142),
+    line_items: [{ item_type: 'monthly_salary', amount: 48000 }, ...lineItems],
+  })
+
+  async function generate(roster: unknown[]) {
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    enqueueHappyPath(enqueueMany, roster)
+    return generateAgiDeclaration({ supabase: supabase as never, ...ARGS })
+  }
+
+  it('no payment: FK013 carries the whole benefit (unchanged)', async () => {
+    const result = await generate([row([CAR], 6664)])
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const iu = iuBlockFor(result.xml, '199001011234')
+    expect(iu).toContain('<gem:SkatteplBilformanUlagAG faltkod="013">6664</gem:SkatteplBilformanUlagAG>')
+  })
+
+  it('payment equal to the benefit: no FK013 at all, the salary stays on FK011', async () => {
+    const result = await generate([row([CAR, payment(-6664)], 0)])
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const iu = iuBlockFor(result.xml, '199001011234')
+    expect(iu).not.toContain('faltkod="013"')
+    expect(iu).toContain('<gem:KontantErsattningUlagAG faltkod="011">48000</gem:KontantErsattningUlagAG>')
+  })
+
+  it('partial payment: FK013 carries benefit minus payment', async () => {
+    const result = await generate([row([CAR, payment(-2000)], 4664)])
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const iu = iuBlockFor(result.xml, '199001011234')
+    expect(iu).toContain('<gem:SkatteplBilformanUlagAG faltkod="013">4664</gem:SkatteplBilformanUlagAG>')
+  })
+
+  it('refuses a payslip calculated before the reduction existed: its stored underlag still holds the whole benefit', async () => {
+    // benefit_values 6664 = the pre-fix engine's unreduced value.
+    const result = await generate([row([CAR, payment(-6664)], 6664)])
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.code).toBe('AGI_INCOMPLETE_DATA')
+    const message = JSON.stringify(result.details)
+    expect(message).toContain('Anställd 1, 2026-06')
+    expect(message).toContain('Räkna om lönekörningen')
+    expect(message).toContain('Korrigera lönekörning')
+    expect(message).toContain('arbetsgivardeklarationen')
+  })
+
+  it('a removed employee (FK205 tombstone) never blocks the AGI, however stale or ambiguous their rows', async () => {
+    // The tombstone emits identity fields only, so nothing on it can be
+    // inconsistent. Refusing here would block the correction that removes them.
+    const staleRemoved = { ...row([CAR, payment(-6664)], 6664), removed_from_agi: true }
+    const ambiguousRemoved = {
+      ...row([CAR, { item_type: 'benefit_meals', amount: 2480 }, payment(-2480)], 9144),
+      removed_from_agi: true,
+    }
+    for (const removed of [staleRemoved, ambiguousRemoved]) {
+      const result = await generate([removed])
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      const iu = iuBlockFor(result.xml, '199001011234')
+      expect(iu).toContain('<gem:Borttag faltkod="205">1</gem:Borttag>')
+      expect(iu).not.toContain('faltkod="013"')
+    }
+  })
+
+  it('still validates the live employees next to a removed one', async () => {
+    const removed = { ...row([CAR, payment(-6664)], 6664), removed_from_agi: true }
+    const liveAndStale = {
+      ...row([CAR, payment(-6664)], 6664),
+      employee_id: '33333333-3333-4333-8333-333333333333',
+      employee: { personnummer: 'emp2_encrypted', specification_number: 2, f_skatt_status: 'a_skatt' },
+    }
+    const result = await generate([removed, liveAndStale])
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.code).toBe('AGI_INCOMPLETE_DATA')
+    expect(JSON.stringify(result.details)).toContain('Anställd 2, 2026-06')
+  })
+
+  it('refuses a payment on a payslip with several benefit types instead of guessing a field', async () => {
+    const result = await generate([row([CAR, { item_type: 'benefit_meals', amount: 2480 }, payment(-2480)], 9144)])
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.code).toBe('AGI_INCOMPLETE_DATA')
+    expect(JSON.stringify(result.details)).toContain('flera förmånstyper')
   })
 })
