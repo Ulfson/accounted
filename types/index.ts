@@ -2466,6 +2466,8 @@ export interface CreateJournalEntryLineInput {
 
 export type PendingOperationType =
   | 'categorize_transaction'
+  // Arkiv: an agent's fact proposal, recorded on approval (lib/arkiv/facts/propose.ts)
+  | 'arkiv_propose_fact'
   | 'create_customer'
   | 'update_customer'
   | 'update_company_settings'
@@ -2798,9 +2800,14 @@ export interface Deadline {
   linked_report_type: string | null
   linked_report_period: Record<string, unknown> | null
   tax_assessment_notice_id: string | null
+  // Arkiv: set on deadlines derived from a document (an agreement's notice
+  // or end date); source_key is the idempotency key of the derivation.
+  source_document_id: string | null
+  source_key: string | null
 
   // Relations
   customer?: Customer
+  source_document?: { file_name: string } | null
 }
 
 // ============================================================
@@ -2997,7 +3004,7 @@ export interface InboxChannelContext {
   peppol_sender_endpoint?: string | null
   /** Archived exact UBL XML, when the inbox document is a rendering (embedded PDF) instead. */
   peppol_xml_document_id?: string | null
-  /** Set by lib/receipt-hunt/ingest.ts: which mailbox the receipt came out of. */
+  /** Set by the removed Gmail receipt hunt: which mailbox the receipt came out of. Kept for existing rows. */
   mail_mailbox?: string | null
   mail_provider?: 'gmail' | 'microsoft' | null
   mail_subject?: string | null
@@ -3436,7 +3443,7 @@ export type DocumentUploadSource =
   | 'api'
   | 'system'
   | 'whatsapp'
-  /** Fetched by the receipt hunt out of a connected mailbox. */
+  /** Fetched out of a connected mailbox by the removed Gmail receipt hunt. Kept for existing rows. */
   | 'mail_hunt'
 
 export interface DocumentAttachment {

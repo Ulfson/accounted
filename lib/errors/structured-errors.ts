@@ -3006,6 +3006,15 @@ const PROVIDER_MIGRATION: Record<string, StructuredErrorEntry> = {
 // ─────────────────────────────────────────────────────────────────
 
 const DOCUMENT: Record<string, StructuredErrorEntry> = {
+  // Arkiv rolls out per company (ARKIV_COMPANY_IDS). Outside the rollout the
+  // Arkiv tools refuse; coded so an agent reads "not switched on" and moves
+  // on, instead of the generic "Något gick fel" that invites a retry.
+  ARKIV_NOT_ENABLED: {
+    httpStatus: 403,
+    message_sv: 'Arkiv är inte aktiverat för det här företaget ännu.',
+    message_en: 'Arkiv is not enabled for this company yet.',
+    retryable: false,
+  },
   // Signed-URL (direct-to-storage) upload: completion found no object under
   // the reservation. The bytes never landed, or the reservation expired.
   DOCUMENT_UPLOAD_NOT_FOUND: {
@@ -3812,6 +3821,13 @@ const SALARY: Record<string, StructuredErrorEntry> = {
     message_en:
       'One or more employees with a net payout lack a clearing number or account number. Complete their bank details under Employees.',
   },
+  SALARY_RUN_PAYMENT_FILE_EMPLOYEE_BANK_INVALID: {
+    httpStatus: 422,
+    message_sv:
+      'En eller flera anställda har bankuppgifter som betalfilen inte kan ta med. details.employees anger vem och vad som behöver rättas.',
+    message_en:
+      'One or more employees have bank details the payment file cannot carry. details.employees names who and what to correct.',
+  },
   SALARY_RUN_PAYMENT_FILE_GENERATION_FAILED: {
     httpStatus: 400,
     message_sv: 'Betalfilen kunde inte skapas: kontrollera bankuppgifterna för företaget och de anställda.',
@@ -3937,6 +3953,11 @@ const API_KEY: Record<string, StructuredErrorEntry> = {
 // ─────────────────────────────────────────────────────────────────
 
 const PROVIDER: Record<string, StructuredErrorEntry> = {
+  PROVIDER_CONFIGURATION_ERROR: {
+    httpStatus: 503,
+    message_sv: 'Fortnox-anslutningen behöver åtgärdas av Accounted. Kontakta supporten. Du behöver inte återansluta.',
+    message_en: 'The Fortnox connection needs attention from Accounted. Contact support. You do not need to reconnect.',
+  },
   PROVIDER_AUTH_EXPIRED: {
     httpStatus: 401,
     message_sv: 'Anslutningen till leverantören har gått ut. Återanslut för att fortsätta.',
@@ -3956,9 +3977,9 @@ const PROVIDER: Record<string, StructuredErrorEntry> = {
   PROVIDER_LICENSE_MISSING: {
     httpStatus: 403,
     message_sv:
-      'Fortnox nekade anslutningen eftersom integrationslicensen inte är aktiv. Aktivera tilläggstjänsten "Fortnox Integration" i ditt Fortnox-konto (Inställningar → Tilläggstjänster) och återanslut sedan. Du kan även importera via SIE-fil under tiden.',
+      'Fortnox nekade åtkomst eftersom en licens saknas eller inte är aktiv. Kontrollera integrations- eller applicensen i Fortnox och försök sedan igen. Du kan även importera via SIE-fil under tiden.',
     message_en:
-      'Fortnox refused the connection because the integration license is not active. Activate the "Fortnox Integration" add-on in your Fortnox account, then reconnect. You can also import via SIE file in the meantime.',
+      'Fortnox refused access because a license is missing or inactive. Check the integration or app license in Fortnox, then try again. You can also import via SIE file in the meantime.',
   },
   PROVIDER_API_MODULE_INACTIVE: {
     httpStatus: 403,
@@ -4080,6 +4101,29 @@ const LINK_SI_VOUCHER: Record<string, StructuredErrorEntry> = {
       tool: 'gnubok_correct_entry',
     },
   },
+  // The three below only arise on the kontantmetod side (19xx credit): see
+  // supplier_invoice_settlement_side, migration 20260921190300.
+  LINK_SI_VOUCHER_NO_BANK_CREDIT: {
+    httpStatus: 400,
+    message_sv:
+      'Verifikationen krediterar inget kassa- eller bankkonto (19xx), så den kan inte vara betalningen av fakturan. Välj verifikationen där pengarna lämnade kontot.',
+    message_en:
+      'The journal entry does not credit a cash or bank account (19xx), so it cannot be the payment of this invoice. On kontantmetoden the payment verifikat is the one where the money left the account (Dr cost, Dr 2641 / Cr 19xx).',
+  },
+  LINK_SI_VOUCHER_FULLY_ALLOCATED: {
+    httpStatus: 409,
+    message_sv:
+      'Verifikationens utbetalning är redan kopplad till andra leverantörsfakturor och har inget belopp kvar. Välj en annan verifikation.',
+    message_en:
+      'The voucher\'s bank credit is already used by payment rows for other supplier invoices; nothing is left to settle this one. Pick a different voucher.',
+  },
+  LINK_SI_VOUCHER_CUTOFF_ALREADY_POSTED: {
+    httpStatus: 409,
+    message_sv:
+      'Bokslutets periodisering enligt kontantmetoden är redan bokförd för ett år som omfattar både fakturan och betalningen, och den räknade fakturan som obetald. Rätta periodiseringen först (storno och bokför om), koppla sedan verifikationen.',
+    message_en:
+      'A posted kontantmetod year-end cut-off covers both the invoice and the payment voucher and counted this invoice as unpaid. Correct the cut-off first (storno and re-post), then link the voucher.',
+  },
   LINK_SI_VOUCHER_ALREADY_LINKED: {
     httpStatus: 409,
     message_sv: 'Verifikationen är redan länkad till den här leverantörsfakturan.',
@@ -4088,9 +4132,9 @@ const LINK_SI_VOUCHER: Record<string, StructuredErrorEntry> = {
   LINK_SI_VOUCHER_AMOUNT_EXCEEDS_REMAINING: {
     httpStatus: 400,
     message_sv:
-      'Verifikationens leverantörsskuldsdebitering är större än leverantörsfakturans återstående belopp. Verifikationen täcker fler fakturor: välj en annan verifikation eller rätta beloppet först.',
+      'Verifikationens belopp är större än leverantörsfakturans återstående belopp. Verifikationen täcker fler fakturor: välj en annan verifikation eller rätta beloppet först.',
     message_en:
-      'The voucher\'s AP debit exceeds the supplier invoice\'s remaining balance. Split the voucher across multiple supplier invoices via gnubok_correct_entry first, or pick a different voucher.',
+      'The voucher\'s settlement amount (details.ap_debit: the 244x debit, or details.bank_credit: the 19xx credit on kontantmetoden) exceeds the supplier invoice\'s remaining balance. Split the voucher across multiple supplier invoices via gnubok_correct_entry first, or pick a different voucher.',
   },
   LINK_SI_VOUCHER_CURRENCY_MISMATCH: {
     httpStatus: 400,
