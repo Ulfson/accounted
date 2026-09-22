@@ -82,6 +82,7 @@ export function entrySettlesAmount(
   return { ok: false, via: null }
 }
 
+/** Match every nonzero signed 1630 line to one selected row, including repeated amounts. */
 function entryLinesMatchZeroNetRows(lines: EntryForLink['lines'], amounts: number[]): boolean {
   const onAccount = (lines ?? []).filter((line) => line.account_number === SKATTEKONTO_ACCOUNT)
   if (onAccount.length !== amounts.length) return false
