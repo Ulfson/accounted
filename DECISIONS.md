@@ -671,3 +671,4 @@ Keep the current calendar month here. Archive completed months verbatim under `d
 [2026-09-22] File subledgers start with open SEK accrual invoices on 1510/2440: exact original-voucher links and zero reconciliation differences avoid duplicate bookkeeping. Unsupported credits, FX and missing vouchers fail closed instead of inventing invoice state.
 
 [2026-09-22] File subledger imports advance only canonical customer invoice numbers in the configured prefix: preserving imported numbers without advancing the counter can block the next issued invoice. Preview binds the counter; import updates it atomically without lowering it.
+[2026-09-23] PR 2860 rebased onto main with the subledger importer under src/: #2932 moved application code, so the pre-move paths would not build. The three original migrations are unchanged.
